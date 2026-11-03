@@ -8,7 +8,8 @@ import {
   DeleteDataSchema, ImportFromFileSchema, ExportToFileSchema,
   CreateEntitiesSchema, CreateRelationsSchema, AddObservationsSchema,
   DeleteEntitiesSchema, DeleteObservationsSchema, DeleteRelationsSchema,
-  SearchNodesSchema, OpenNodesSchema, ReadGraphSchema, ReadGraphStreamSchema
+  SearchNodesSchema, OpenNodesSchema, ReadGraphSchema, ReadGraphStreamSchema,
+  CreateMissionSchema, ListMissionsSchema, UpdateMissionSchema
 } from '../types.js';
 import {
   AnalyzeGitChangesSchema, CacheDeleteSchema, CacheGetSchema, CacheScanSchema, CacheSetSchema,
@@ -56,7 +57,11 @@ const toolSchemas: Record<string, z.ZodSchema> = {
   cache_scan: CacheScanSchema,
   set_project_root: SetProjectRootSchema,
   list_harness_stores: ListHarnessStoresSchema,
-  sync_harness_sessions: SyncHarnessSessionsSchema,  setup_pre_commit: SetupPreCommitSchema,
+  sync_harness_sessions: SyncHarnessSessionsSchema,
+  create_mission: CreateMissionSchema,
+  list_missions: ListMissionsSchema,
+  update_mission: UpdateMissionSchema,
+  setup_pre_commit: SetupPreCommitSchema,
   sync_central_memory: SyncCentralMemorySchema,
 };
 
@@ -90,6 +95,10 @@ export class RequestHandlers {
 
       if (['initialize_memory', 'create_entity', 'create_relation', 'add_observation', 'delete_entity', 'delete_observation', 'delete_relation', 'read_graph', 'search_nodes', 'open_node', 'list_harness_stores', 'sync_harness_sessions'].includes(name)) {
         return await this.handleMemoryTool(name, args);
+      }
+
+      if (['create_mission', 'list_missions', 'update_mission'].includes(name)) {
+        return await this.handleMissionTool(name, args);
       }
 
       if (name === 'get_project_guidance') {
@@ -333,6 +342,38 @@ export class RequestHandlers {
             : `Synced ${created} new, ${updated} updated sessions`,
         };
       }
+    }
+  }
+
+  private async handleMissionTool(name: string, args: any): Promise<any> {
+    const dbSelector = args.database === 'central' ? 'central' : 'project';
+    switch (name) {
+      case 'create_mission': {
+        const mission = await this.memoryManager.createMission(args, dbSelector);
+        return {
+          success: true,
+          data: mission,
+          message: `Mission ${mission.id} created successfully`
+        };
+      }
+      case 'list_missions': {
+        const missions = await this.memoryManager.listMissions(args, dbSelector);
+        return {
+          success: true,
+          data: missions,
+          message: `Found ${missions.length} missions`
+        };
+      }
+      case 'update_mission': {
+        const updated = await this.memoryManager.updateMission(args, dbSelector);
+        return {
+          success: true,
+          data: updated,
+          message: `Mission ${updated.id} updated successfully`
+        };
+      }
+      default:
+        throw new Error(`Unknown mission tool: ${name}`);
     }
   }
 }

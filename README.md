@@ -20,9 +20,10 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - [Installation](#installation)
 - [Available Tools](#available-tools)
   - [Database Operations (7 tools)](#database-operations-7-tools)
-  - [Memory and Guidance Tools (11 tools)](#memory-and-guidance-tools-11-tools)
+  - [Memory and Guidance Tools (13 tools)](#memory-and-guidance-tools-13-tools)
+  - [Fleet Mission Ledger Tools (3 tools)](#fleet-mission-ledger-tools-3-tools)
   - [Runtime Companion Tools (12 tools)](#runtime-companion-tools-12-tools)
-  - [UI Tools (4 tools)](#ui-tools-3-tools)
+  - [UI Tools (4 tools)](#ui-tools-4-tools)
 - [AI Guidance System](#ai-guidance-system)
   - [Available Resources](#available-resources)
   - [Available Prompts](#available-prompts)
@@ -70,7 +71,7 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - **Core CRUD**: Essential database operations (query, insert, update, delete)
 - **SQL Execution**: Direct SQL query execution
 - **Data Transfer**: Import/export CSV and JSON files
-- **34 Tools Total**: Seven database tools, ten memory tools, one guidance tool, twelve runtime companion tools, and four UI/stream tools (`start_ui`, `close_ui`, `stop_ui`, `read_graph_stream`)
+- **39 Tools Total**: Seven database tools, ten memory tools, one guidance tool, three fleet mission tools, twelve runtime companion tools, two session bridge tools, and four UI/stream tools (`start_ui`, `close_ui`, `stop_ui`, `read_graph_stream`)
 
 ### Runtime Companion Integration
 
@@ -340,6 +341,46 @@ Invoke a project guidance framework to receive specialized instructions and chec
 **Parameters:**
 - `guidance_name` (required): Name of the guidance (e.g., project-setup, sprint-planning)
 - `arguments` (optional): Arguments required by the specific guidance framework
+
+### Fleet Mission Ledger Tools (3 tools)
+
+Coordinate tasks and multi-agent workflows across swarms or fleets with an atomic SQLite-backed mission board. Designed for distributed agents (e.g. local desktop and remote servers) to share tasks without heavy broker infrastructure.
+
+#### `create_mission`
+Enqueue a mission into the fleet mission ledger. Supports assigning to specific agent targets (`frea`, `mema`, `orchestrator`, `human`, or `any`), priorities (`low`, `normal`, `high`, `urgent`), and arbitrary JSON payloads.
+
+**Parameters:**
+- `title` (required): Summary or title of the mission
+- `description` (optional): Detailed context or instructions
+- `originAgent` (optional, default: `agent`): Originating agent or user
+- `targetAgent` (optional, default: `any`): Target agent assigned to execute
+- `priority` (optional, default: `normal`): `low` | `normal` | `high` | `urgent`
+- `payload` (optional): Input parameters or data
+- `database` (optional, default: `project`): `project` | `central`
+
+#### `list_missions`
+Query missions from the ledger filtered by status, agent target, origin, or claiming agent.
+
+**Parameters:**
+- `id` (optional): Specific mission ID to fetch
+- `status` (optional): `queued` | `claimed` | `in_progress` | `completed` | `failed` | `cancelled`
+- `targetAgent` (optional): Filter by target agent
+- `originAgent` (optional): Filter by origin agent
+- `claimedBy` (optional): Filter by agent currently executing
+- `limit` (optional, default: 50, max: 200): Pagination limit
+- `offset` (optional, default: 0): Pagination offset
+- `database` (optional, default: `project`): `project` | `central`
+
+#### `update_mission`
+Claim a mission or report its lifecycle progress (e.g. marking `completed` with output results, or `failed` with an error message). Automatically records timestamps (`claimed_at`, `completed_at`, `updated_at`).
+
+**Parameters:**
+- `id` (required): Mission ID to update
+- `status` (optional): New status
+- `claimedBy` (optional): Agent claiming the mission
+- `result` (optional): JSON result or return value upon completion
+- `error` (optional): Error message if mission failed
+- `database` (optional, default: `project`): `project` | `central`
 
 ### Runtime Companion Tools (12 tools)
 
