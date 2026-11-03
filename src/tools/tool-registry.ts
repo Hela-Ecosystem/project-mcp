@@ -1,6 +1,7 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { databaseTools } from './database-tools.js';
 import { memoryTools } from './memory-tools.js';
+import { missionTools } from './mission-tools.js';
 import { guidanceTools } from './guidance-tools.js';
 import { runtimeTools } from './runtime-tools.js';
 import { sessionBridgeTools } from './session-bridge-tools.js';
@@ -8,6 +9,7 @@ import { sessionBridgeTools } from './session-bridge-tools.js';
 export const allTools: Tool[] = [
   ...databaseTools,
   ...memoryTools,
+  ...missionTools,
   ...guidanceTools,
   ...runtimeTools,
   ...sessionBridgeTools,

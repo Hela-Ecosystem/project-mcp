@@ -1,5 +1,5 @@
 import { SQLiteManager } from './sqlite-manager.js';
-import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry } from './types.js';
+import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
 import { ObsidianVaultMirror } from './obsidian-vault.js';
 import { sanitizePrivateContent } from './utils/sanitize.js';
 import {
@@ -124,9 +124,35 @@ export class MemoryManager {
     });
     
     await this.ensureFtsSchema(this.centralDbPath);
+    await this.ensureMissionsSchema(this.centralDbPath);
     try {
       await this.sqliteManager.executeSql(this.centralDbPath, `CREATE VIRTUAL TABLE IF NOT EXISTS vec_entities USING vec0(embedding float[${384}])`);
     } catch (e) { void e; }
+  }
+
+  private async ensureMissionsSchema(dbName: string): Promise<void> {
+    await this.sqliteManager.executeSql(dbName, `
+      CREATE TABLE IF NOT EXISTS missions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        origin_agent TEXT NOT NULL,
+        target_agent TEXT NOT NULL DEFAULT 'any',
+        status TEXT NOT NULL DEFAULT 'queued',
+        priority TEXT NOT NULL DEFAULT 'normal',
+        payload TEXT,
+        result TEXT,
+        error TEXT,
+        claimed_by TEXT,
+        claimed_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    await this.sqliteManager.executeSql(dbName, `CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);`);
+    await this.sqliteManager.executeSql(dbName, `CREATE INDEX IF NOT EXISTS idx_missions_target_status ON missions(target_agent, status);`);
+    await this.sqliteManager.executeSql(dbName, `CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);`);
   }
 
   private projectSchemaReady = false;
@@ -161,6 +187,7 @@ export class MemoryManager {
     const r2 = await this.sqliteManager.executeSql(this.memoryDbName, 'CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at)');
     if (!r2.success) console.warn('Failed to create entity updated index:', r2.error);
     await this.ensureFtsSchema(this.memoryDbName);
+    await this.ensureMissionsSchema(this.memoryDbName);
     const vecRes = await this.sqliteManager.executeSql(this.memoryDbName, `CREATE VIRTUAL TABLE IF NOT EXISTS vec_entities USING vec0(embedding float[384])`);
     if (!vecRes.success) console.warn('[vec] create table failed for', this.memoryDbName, vecRes.error);
     // P1-C2: provenance sidecar for externally-sourced observation facts
@@ -1571,6 +1598,178 @@ export class MemoryManager {
     return {
       entries: cappedEntries,
       total: cappedEntries.length,
+    };
+  }
+
+  async createMission(input: CreateMissionInput, dbSelector: 'project' | 'central' = 'project'): Promise<Mission> {
+    const dbTarget = dbSelector === 'central' ? this.centralDbPath : this.memoryDbName;
+    await this.ensureMissionsSchema(dbTarget);
+
+    const now = new Date().toISOString();
+    const id = `msn_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 9)}`;
+    const title = input.title;
+    const description = input.description ?? null;
+    const originAgent = input.originAgent ?? 'agent';
+    const targetAgent = input.targetAgent ?? 'any';
+    const priority = input.priority ?? 'normal';
+    const payloadStr = input.payload !== undefined ? JSON.stringify(input.payload) : null;
+    const status = 'queued';
+
+    const insertRes = await this.sqliteManager.executeSql(
+      dbTarget,
+      `INSERT INTO missions (id, title, description, origin_agent, target_agent, status, priority, payload, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, title, description, originAgent, targetAgent, status, priority, payloadStr, now, now]
+    );
+
+    if (!insertRes.success) {
+      throw new Error(`Failed to create mission: ${insertRes.error}`);
+    }
+
+    return {
+      id,
+      title,
+      description: input.description,
+      originAgent,
+      targetAgent,
+      status,
+      priority,
+      payload: input.payload,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  async listMissions(filter: ListMissionsInput = {}, dbSelector: 'project' | 'central' = 'project'): Promise<Mission[]> {
+    const dbTarget = dbSelector === 'central' ? this.centralDbPath : this.memoryDbName;
+    await this.ensureMissionsSchema(dbTarget);
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (filter.id) {
+      conditions.push('id = ?');
+      params.push(filter.id);
+    }
+    if (filter.status) {
+      conditions.push('status = ?');
+      params.push(filter.status);
+    }
+    if (filter.targetAgent) {
+      conditions.push('target_agent = ?');
+      params.push(filter.targetAgent);
+    }
+    if (filter.originAgent) {
+      conditions.push('origin_agent = ?');
+      params.push(filter.originAgent);
+    }
+    if (filter.claimedBy) {
+      conditions.push('claimed_by = ?');
+      params.push(filter.claimedBy);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limit = filter.limit ?? 50;
+    const offset = filter.offset ?? 0;
+    params.push(limit, offset);
+
+    const queryRes = await this.sqliteManager.executeSql(
+      dbTarget,
+      `SELECT * FROM missions ${whereClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+      params
+    );
+
+    if (!queryRes.success || !queryRes.data) {
+      throw new Error(`Failed to list missions: ${queryRes.error}`);
+    }
+
+    return (queryRes.data.rows || []).map((row: any) => this.mapMissionRow(row));
+  }
+
+  async updateMission(input: UpdateMissionInput, dbSelector: 'project' | 'central' = 'project'): Promise<Mission> {
+    const dbTarget = dbSelector === 'central' ? this.centralDbPath : this.memoryDbName;
+    await this.ensureMissionsSchema(dbTarget);
+
+    const now = new Date().toISOString();
+    const updates: string[] = ['updated_at = ?'];
+    const params: any[] = [now];
+
+    if (input.status !== undefined) {
+      updates.push('status = ?');
+      params.push(input.status);
+      if (input.status === 'completed' || input.status === 'failed' || input.status === 'cancelled') {
+        updates.push('completed_at = ?');
+        params.push(now);
+      }
+    }
+
+    if (input.claimedBy !== undefined) {
+      updates.push('claimed_by = ?');
+      params.push(input.claimedBy);
+      updates.push('claimed_at = ?');
+      params.push(now);
+      if (!input.status) {
+        updates.push('status = ?');
+        params.push('claimed');
+      }
+    }
+
+    if (input.result !== undefined) {
+      updates.push('result = ?');
+      params.push(JSON.stringify(input.result));
+    }
+
+    if (input.error !== undefined) {
+      updates.push('error = ?');
+      params.push(input.error);
+    }
+
+    params.push(input.id);
+
+    const updateRes = await this.sqliteManager.executeSql(
+      dbTarget,
+      `UPDATE missions SET ${updates.join(', ')} WHERE id = ?`,
+      params
+    );
+
+    if (!updateRes.success) {
+      throw new Error(`Failed to update mission: ${updateRes.error}`);
+    }
+
+    const rows = await this.sqliteManager.executeSql(dbTarget, `SELECT * FROM missions WHERE id = ?`, [input.id]);
+    if (!rows.success || !rows.data || rows.data.rows.length === 0) {
+      throw new Error(`Mission not found: ${input.id}`);
+    }
+
+    return this.mapMissionRow(rows.data.rows[0]);
+  }
+
+  private mapMissionRow(row: any): Mission {
+    let payload = undefined;
+    if (row.payload) {
+      try { payload = JSON.parse(row.payload); } catch { payload = row.payload; }
+    }
+    let result = undefined;
+    if (row.result) {
+      try { result = JSON.parse(row.result); } catch { result = row.result; }
+    }
+
+    return {
+      id: row.id,
+      title: row.title,
+      description: row.description || undefined,
+      originAgent: row.origin_agent,
+      targetAgent: row.target_agent,
+      status: row.status,
+      priority: row.priority,
+      payload,
+      result,
+      error: row.error || undefined,
+      claimedBy: row.claimed_by || undefined,
+      claimedAt: row.claimed_at || undefined,
+      completedAt: row.completed_at || undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 }

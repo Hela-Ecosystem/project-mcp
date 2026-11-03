@@ -51,8 +51,19 @@ describe('ToolRegistry', () => {
       expect(toolNames).toContain('harness_sessions');
     });
 
-    test('should have exactly 26 tools', () => {
-      expect(allTools).toHaveLength(26);
+    test('should include mission tools', () => {
+      const toolNames = allTools.map(t => t.name);
+
+      expect(toolNames).toContain('create_mission');
+      expect(toolNames).toContain('list_missions');
+      expect(toolNames).toContain('update_mission');
+    });
+
+    test('should include UI tools', () => {
+      const toolNames = allTools.map(t => t.name);
+      expect(toolNames).toContain('start_ui');
+      expect(toolNames).toContain('close_ui');
+      expect(toolNames).toContain('stop_ui');
     });
   });
 

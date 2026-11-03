@@ -550,3 +550,60 @@ export const HarnessSessionsSchema = z.discriminatedUnion('action', [
 ]);
 
 export type SyncHarnessSessionsInput = z.infer<typeof SyncHarnessSessionsSchema>;
+
+// Fleet Mission Ledger types and schemas
+export type MissionStatus = 'queued' | 'claimed' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
+export type MissionPriority = 'low' | 'normal' | 'high' | 'urgent';
+
+export interface Mission {
+  id: string;
+  title: string;
+  description?: string;
+  originAgent: string;
+  targetAgent: string;
+  status: MissionStatus;
+  priority: MissionPriority;
+  payload?: any;
+  result?: any;
+  error?: string;
+  claimedBy?: string;
+  claimedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const CreateMissionSchema = z.object({
+  title: z.string().min(1).max(500),
+  description: z.string().max(10000).optional(),
+  originAgent: z.string().min(1).max(100).default('agent'),
+  targetAgent: z.string().min(1).max(100).default('any'),
+  priority: z.enum(['low', 'normal', 'high', 'urgent']).default('normal'),
+  payload: z.any().optional(),
+  database: z.enum(['project', 'central']).default('project').optional(),
+});
+
+export const ListMissionsSchema = z.object({
+  id: z.string().optional(),
+  status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']).optional(),
+  targetAgent: z.string().optional(),
+  originAgent: z.string().optional(),
+  claimedBy: z.string().optional(),
+  limit: z.number().int().min(1).max(200).default(50).optional(),
+  offset: z.number().int().min(0).default(0).optional(),
+  database: z.enum(['project', 'central']).default('project').optional(),
+});
+
+export const UpdateMissionSchema = z.object({
+  id: z.string().min(1),
+  status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']).optional(),
+  claimedBy: z.string().optional(),
+  result: z.any().optional(),
+  error: z.string().max(10000).optional(),
+  database: z.enum(['project', 'central']).default('project').optional(),
+});
+
+export type CreateMissionInput = z.input<typeof CreateMissionSchema>;
+export type ListMissionsInput = z.input<typeof ListMissionsSchema>;
+export type UpdateMissionInput = z.input<typeof UpdateMissionSchema>;
+
