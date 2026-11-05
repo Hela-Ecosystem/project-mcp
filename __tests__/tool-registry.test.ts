@@ -59,11 +59,15 @@ describe('ToolRegistry', () => {
       expect(toolNames).toContain('update_mission');
     });
 
-    test('should include UI tools', () => {
+    test('should exclude removed UI tools', () => {
       const toolNames = allTools.map(t => t.name);
-      expect(toolNames).toContain('start_ui');
-      expect(toolNames).toContain('close_ui');
-      expect(toolNames).toContain('stop_ui');
+      for (const name of ['start_ui', 'close_ui', 'stop_ui']) {
+        expect(toolNames).not.toContain(name);
+      }
+    });
+
+    test('should include streaming graph tool', () => {
+      expect(allTools.map(t => t.name)).toContain('read_graph_stream');
     });
   });
 

@@ -3,19 +3,27 @@ import { MemoryManager } from '../src/memory-manager';
 import { RequestHandlers } from '../src/handlers/request-handlers';
 import { ImportExportManager } from '../src/import-export';
 import { PromptHandlers } from '../src/prompts/prompt-handlers';
-import { existsSync, unlinkSync, rmdirSync, readdirSync } from 'fs';
+import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 
 describe('Fleet Mission Ledger Tools', () => {
   let sqliteManager: SQLiteManager;
   let memoryManager: MemoryManager;
   let requestHandlers: RequestHandlers;
   let testDbPath: string;
+  let savedEnvironment: NodeJS.ProcessEnv;
 
   beforeEach(async () => {
-    testDbPath = `./test-databases-mission-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    savedEnvironment = { ...process.env };
+    testDbPath = mkdtempSync(join(tmpdir(), 'guardian-mission-tools-'));
+    process.env.NODE_ENV = 'test';
+    process.env.GUARDIAN_CENTRAL_DB = join(testDbPath, 'central.db');
+    delete process.env.HELA_GENOME_OBSIDIAN_VAULT;
+    delete process.env.HELA_GENOME_OBSIDIAN_SYNC_CMD;
+    delete process.env.HELA_GENOME_OBSIDIAN_PULL_CMD;
     sqliteManager = new SQLiteManager(testDbPath);
-    memoryManager = new MemoryManager(sqliteManager);
+    memoryManager = new MemoryManager(sqliteManager, testDbPath);
     const importExport = new ImportExportManager(sqliteManager);
     const promptHandlers = new PromptHandlers();
     requestHandlers = new RequestHandlers(sqliteManager, memoryManager, importExport, promptHandlers);
@@ -25,13 +33,8 @@ describe('Fleet Mission Ledger Tools', () => {
 
   afterEach(async () => {
     await sqliteManager.closeAllConnections();
-    if (existsSync(testDbPath)) {
-      const files = readdirSync(testDbPath);
-      for (const file of files) {
-        if (file.endsWith('.db')) unlinkSync(join(testDbPath, file));
-      }
-      rmdirSync(testDbPath);
-    }
+    rmSync(testDbPath, { recursive: true, force: true });
+    process.env = savedEnvironment;
   });
 
   describe('MemoryManager Mission Operations', () => {
@@ -154,6 +157,27 @@ describe('Fleet Mission Ledger Tools', () => {
       expect(updateRes.success).toBe(true);
       expect(updateRes.data.status).toBe('in_progress');
       expect(updateRes.data.claimedBy).toBe('agent-alpha');
+    });
+
+    test.each([
+      { claimedBy: '' },
+      { claimedBy: '   ' },
+      { claimedBy: null },
+      { claimedBy: 'x'.repeat(101) },
+      { status: 'claimed' },
+      { status: 'completed', claimedBy: 'agent-alpha' },
+    ])('rejects invalid claims via tool validation: %j', async (claim) => {
+      const mission = await memoryManager.createMission({ title: 'Invalid claim test' });
+      await expect(requestHandlers.handleToolCall('update_mission', { id: mission.id, ...claim })).rejects.toThrow('Tool execution failed:');
+      expect((await memoryManager.listMissions({ id: mission.id }))[0]).toMatchObject({ status: 'queued' });
+    });
+
+    test('returns a tool error when a mission is already claimed', async () => {
+      const mission = await memoryManager.createMission({ title: 'Exclusive tool claim' });
+      const first = await requestHandlers.handleToolCall('update_mission', { id: mission.id, claimedBy: 'first' });
+      expect(first.success).toBe(true);
+      await expect(requestHandlers.handleToolCall('update_mission', { id: mission.id, claimedBy: 'second' })).rejects.toThrow('not available for claiming');
+      expect((await memoryManager.listMissions({ id: mission.id }))[0].claimedBy).toBe('first');
     });
 
     test('backward compatibility: entities and relations still work flawlessly', async () => {

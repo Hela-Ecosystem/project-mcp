@@ -1,8 +1,6 @@
-process.env.ENABLE_VECTOR_TEST = '1';
-
 import { SQLiteManager } from '../src/sqlite-manager';
 import { MemoryManager } from '../src/memory-manager';
-import { existsSync, unlinkSync, rmdirSync, readdirSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import os from 'os';
 
@@ -10,40 +8,23 @@ describe('E2E Vector Hybrid RAG', () => {
   let tmpDir: string;
   let sm: SQLiteManager;
   let mm: MemoryManager;
-  const originalEnv = process.env.NODE_ENV;
-  const originalVecFlag = process.env.ENABLE_VECTOR_TEST;
-
-  beforeAll(async () => {
-    // Enable vector in test by switching env
-    process.env.ENABLE_VECTOR_TEST = '1';
-    process.env.NODE_ENV = 'development';
-  }, 120000);
-
-  afterAll(() => {
-    process.env.NODE_ENV = originalEnv;
-    if (originalVecFlag) process.env.ENABLE_VECTOR_TEST = originalVecFlag;
-    else delete process.env.ENABLE_VECTOR_TEST;
-  });
-
   beforeEach(async () => {
-    tmpDir = `${os.tmpdir()}/e2e-vec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    mkdirSync(tmpDir, { recursive: true });
+    expect(process.env.NODE_ENV).toBe('test');
+    expect(process.env.GUARDIAN_CENTRAL_DB).toMatch(/guardian-jest-.*central-\d+\.db$/);
+    expect(process.env.HELA_GENOME_OBSIDIAN_VAULT).toBeUndefined();
+    expect(process.env.HELA_GENOME_OBSIDIAN_SYNC_CMD).toBeUndefined();
+    expect(process.env.HELA_GENOME_OBSIDIAN_PULL_CMD).toBeUndefined();
+    process.env.ENABLE_VECTOR_TEST = '1';
+    tmpDir = mkdtempSync(join(os.tmpdir(), 'e2e-vec-'));
     sm = new SQLiteManager(tmpDir);
     mm = new MemoryManager(sm, tmpDir);
     await mm.initializeMemoryDatabase();
   }, 30000);
 
   afterEach(async () => {
-    if (sm) try { await sm.closeAllConnections(); } catch {}
-    try {
-      if (tmpDir && existsSync(tmpDir)) {
-        const files = readdirSync(tmpDir);
-        for (const f of files) if (f.endsWith('.db') || f.endsWith('.db-wal') || f.endsWith('.db-shm')) {
-          try { unlinkSync(join(tmpDir, f)); } catch {}
-        }
-        rmdirSync(tmpDir, { recursive: true } as any);
-      }
-    } catch {}
+    delete process.env.ENABLE_VECTOR_TEST;
+    if (sm) await sm.closeAllConnections();
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
   });
 
   test('hybrid search finds semantic match that keyword misses', async () => {
@@ -51,45 +32,33 @@ describe('E2E Vector Hybrid RAG', () => {
     await mm.createEntity('task:auth-login', 'task', ['Implement login with JWT', 'Handle authentication failure and session timeout']);
     await mm.createEntity('task:ui-button', 'task', ['Create button component with hover effect and rounded corners']);
 
-    // debug
-    const dbg = await sm.executeSql('memory', 'SELECT COUNT(*) as c FROM vec_entities');
-    console.log('vec count after 2 creates', dbg.success, dbg.data?.rows[0]?.c, dbg.error);
-    // Wait for async vec upsert (embed is awaited in createEntity, so should be ready)
-    // Keyword search for "auth" should find auth-login only
-    const kw = await mm.searchNodes('auth', 10, 'keyword');
-    console.log('kw', kw.entities.map(e=>e.name).slice(0,3), 'len', kw.entities.length);
-    expect(kw.entities.map(e => e.name)).toContain('task:auth-login');
+    const kw = await mm.searchNodes('authenticate', 10, 'keyword');
+    expect(kw.entities).toHaveLength(0);
 
-    // Vector search for "authentication" (semantic) should find auth-login at top
-    const vec = await mm.searchNodes('authentication', 10, 'vector');
-    console.log('vec', vec.entities.map(e=>e.name), 'len', vec.entities.length, 'full', vec);
+    const vec = await mm.searchNodes('authenticate', 10, 'vector');
     expect(vec.entities.length).toBeGreaterThan(0);
     expect(vec.entities[0].name).toBe('task:auth-login');
 
-    // Hybrid search for "login" should rank auth-login top even with FTS+vec
-    const hyb = await mm.searchNodes('login', 10, 'hybrid');
+    // Hybrid search must retain a semantic match absent from keyword results.
+    const hyb = await mm.searchNodes('authenticate', 10, 'hybrid');
     expect(hyb.entities.length).toBeGreaterThan(0);
     expect(hyb.entities[0].name).toBe('task:auth-login');
 
     // Verify vec table exists and has rows
     const vecCheck = await sm.executeSql('memory', 'SELECT COUNT(*) as c FROM vec_entities');
-    // vec_entities may be empty if embed failed, but should have at least 2 after above creates
-    if (vecCheck.success && vecCheck.data) {
-      expect(vecCheck.data.rows[0].c).toBeGreaterThanOrEqual(2);
-    }
+    expect(vecCheck.success).toBe(true);
+    expect(vecCheck.data?.rows[0].c).toBe(2);
 
     // Add observation to ui-button and verify vec updates (re-embed)
     await mm.addObservation('task:ui-button', ['Add icon support']);
     const vec2 = await mm.searchNodes('icon', 10, 'vector');
-    expect(vec2.entities.map(e => e.name)).toContain('task:ui-button');
+    expect(vec2.entities[0]?.name).toBe('task:ui-button');
 
     // Delete should clean vec
     await mm.deleteEntity('task:ui-button');
     const vecAfterDel = await sm.executeSql('memory', 'SELECT COUNT(*) as c FROM vec_entities');
-    if (vecAfterDel.success && vecAfterDel.data) {
-      // one less
-      expect(vecAfterDel.data.rows[0].c).toBeGreaterThanOrEqual(1);
-    }
+    expect(vecAfterDel.success).toBe(true);
+    expect(vecAfterDel.data?.rows[0].c).toBe(1);
   }, 120000);
 
   test('readStore and readGraph respect limit pagination with vec', async () => {

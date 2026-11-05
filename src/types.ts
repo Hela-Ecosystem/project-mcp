@@ -59,13 +59,13 @@ export const DropTableSchema = z.object({
 export const InsertDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  records: z.array(z.record(z.any())).min(1),
+  records: z.array(z.record(z.string(), z.any())).min(1),
 });
 
 export const QueryDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.any()).optional(),
+  conditions: z.record(z.string(), z.any()).optional(),
   limit: z.number().min(1).max(10000).optional(),
   offset: z.number().min(0).optional(),
   orderBy: z.string().optional(),
@@ -75,20 +75,20 @@ export const QueryDataSchema = z.object({
 export const UpdateDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.any()),
-  updates: z.record(z.any()),
+  conditions: z.record(z.string(), z.any()),
+  updates: z.record(z.string(), z.any()),
 });
 
 export const DeleteDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.any()),
+  conditions: z.record(z.string(), z.any()),
 });
 
 export const CountRecordsSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.any()).optional(),
+  conditions: z.record(z.string(), z.any()).optional(),
 });
 
 // Advanced operations schemas
@@ -115,7 +115,7 @@ export const ExportToFileSchema = z.object({
   table: z.string().min(1),
   filePath: z.string().min(1),
   format: z.enum(['csv', 'json', 'sql']).default('csv'),
-  conditions: z.record(z.any()).optional(),
+  conditions: z.record(z.string(), z.any()).optional(),
   options: z.object({
     delimiter: z.string().optional(),
     includeHeader: z.boolean().optional(),
@@ -597,13 +597,18 @@ export const ListMissionsSchema = z.object({
 export const UpdateMissionSchema = z.object({
   id: z.string().min(1),
   status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']).optional(),
-  claimedBy: z.string().optional(),
+  claimedBy: z.string().trim().min(1).max(100).optional(),
   result: z.any().optional(),
   error: z.string().max(10000).optional(),
   database: z.enum(['project', 'central']).default('project').optional(),
+}).refine(input => input.status !== 'claimed' || input.claimedBy !== undefined, {
+  message: 'claimed status requires claimedBy',
+  path: ['claimedBy'],
+}).refine(input => input.claimedBy === undefined || input.status === undefined || input.status === 'claimed' || input.status === 'in_progress', {
+  message: 'Claims require claimed or in_progress status',
+  path: ['status'],
 });
 
 export type CreateMissionInput = z.input<typeof CreateMissionSchema>;
 export type ListMissionsInput = z.input<typeof ListMissionsSchema>;
 export type UpdateMissionInput = z.input<typeof UpdateMissionSchema>;
-

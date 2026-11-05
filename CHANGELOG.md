@@ -9,6 +9,13 @@ All notable changes to Project Guardian MCP.
 
 ## [Unreleased]
 
+### Memory safety and correctness (2026-11-06)
+- Added baseline-based two-way vault sync with SSH support, conflict/recovery archives, serialized locks, and stale-snapshot checks. Destructive `rsync --delete` mirror hooks are rejected.
+- Fixed relation bullets being reimported as observations, repeated central relation inserts, and unsafe test inheritance of real central/vault paths. Managed note imports preserve concurrent observation edits and ignore hidden recovery files.
+- Replaced database-file copies with integrity-checked SQLite online backups and new-destination-only restores; retained legacy migration sources.
+- Made mission claims exclusive through a conditional SQL update, with independent-connection and multi-process contention tests. Separate local ledger copies are not distributed locks.
+- Updated record schemas for the declared Zod 4 dependency; clean lockfile installs now build and pass the same regression suite as existing installations.
+
 ### Fixed
 - **`read_graph_stream` dispatch** — the tool was registered and documented but missing from the memory dispatch list, causing `Unknown tool`; added regression coverage.
 - **`set_project_root` schema init** — switching roots now resets the schema-ready flag so the new project database is initialized before writes.

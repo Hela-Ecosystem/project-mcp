@@ -1,7 +1,10 @@
 import sqlite3 from 'sqlite3';
 import { promisify } from 'util';
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, openSync, closeSync } from 'fs';
-import { join, isAbsolute } from 'path';
+import {
+  readFileSync, writeFileSync, existsSync, statSync, mkdirSync, openSync, closeSync,
+  lstatSync, realpathSync, mkdtempSync, rmSync, readSync, chmodSync, linkSync
+} from 'fs';
+import { join, isAbsolute, resolve, dirname, basename } from 'path';
 import { 
   DatabaseInfo, 
   TableInfo, 
@@ -10,6 +13,15 @@ import {
   QueryResult, 
   DatabaseOperationResult 
 } from './types.js';
+
+interface SQLiteBackup {
+  step(pages: number, callback: (error: Error | null, complete: boolean) => void): void;
+  finish(callback: () => void): void;
+}
+
+type BackupDatabase = sqlite3.Database & {
+  backup(path: string, callback: (error: Error | null) => void): SQLiteBackup;
+};
 
 export class SQLiteManager {
   private connections: Map<string, sqlite3.Database> = new Map();
@@ -660,8 +672,7 @@ export class SQLiteManager {
         };
       }
       
-      const { copyFileSync } = await import('fs');
-      copyFileSync(dbPath, backupPath);
+      await this.snapshotToNewDestination(dbPath, backupPath);
       
       const executionTime = Date.now() - startTime;
       return {
@@ -692,8 +703,9 @@ export class SQLiteManager {
       }
       
       const dbPath = this.getDatabasePath(databaseName);
-      const { copyFileSync } = await import('fs');
-      copyFileSync(backupPath, dbPath);
+      this.assertNewDatabaseDestination(dbPath);
+      this.assertSQLiteHeader(backupPath);
+      await this.snapshotToNewDestination(backupPath, dbPath);
       
       const executionTime = Date.now() - startTime;
       return {
@@ -708,6 +720,104 @@ export class SQLiteManager {
         message: 'Failed to restore database',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  private assertNewDatabaseDestination(path: string): string {
+    if (typeof path !== 'string' || !path.trim() || path.includes('\0')) {
+      throw new Error('Invalid database destination');
+    }
+    const absolutePath = resolve(path);
+    const destination = join(realpathSync(dirname(absolutePath)), basename(absolutePath));
+    if (/-(wal|shm|journal)$/i.test(destination)) {
+      throw new Error('SQLite sidecar paths cannot be database destinations');
+    }
+    for (const candidate of [destination, `${destination}-wal`, `${destination}-shm`, `${destination}-journal`]) {
+      try {
+        lstatSync(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      throw new Error('Destination or SQLite sidecar already exists; restoring an existing database requires an offline operator procedure');
+    }
+    for (const name of this.connections.keys()) {
+      const connectionPath = resolve(this.getDatabasePath(name));
+      const canonicalPath = join(realpathSync(dirname(connectionPath)), basename(connectionPath));
+      if (canonicalPath === destination) {
+        throw new Error('Destination has an active connection; use an offline operator procedure');
+      }
+    }
+    return destination;
+  }
+
+  private assertSQLiteHeader(path: string): void {
+    if (!statSync(path).isFile()) throw new Error('Backup must be a SQLite database file');
+    const descriptor = openSync(path, 'r');
+    try {
+      const header = Buffer.alloc(16);
+      if (readSync(descriptor, header, 0, header.length, 0) !== header.length ||
+          !header.equals(Buffer.from('SQLite format 3\0'))) {
+        throw new Error('Invalid SQLite database header');
+      }
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  private async openReadOnlyDatabase(path: string): Promise<sqlite3.Database> {
+    return new Promise((resolve, reject) => {
+      const db = new sqlite3.Database(path, sqlite3.OPEN_READONLY, error => {
+        if (error) reject(error);
+        else resolve(db);
+      });
+    });
+  }
+
+  private async closeSnapshotConnection(db: sqlite3.Database): Promise<void> {
+    await new Promise<void>((resolve, reject) => db.close(error => error ? reject(error) : resolve()));
+  }
+
+  private async snapshotToNewDestination(sourcePath: string, destinationPath: string): Promise<void> {
+    const destination = this.assertNewDatabaseDestination(destinationPath);
+    if (!statSync(sourcePath).isFile()) throw new Error('Source must be a SQLite database file');
+    const temporaryDirectory = mkdtempSync(join(dirname(destination), '.guardian-sqlite-backup-'));
+    const snapshotPath = join(temporaryDirectory, 'snapshot.db');
+    try {
+      const source = await this.openReadOnlyDatabase(sourcePath);
+      try {
+        source.configure('busyTimeout', 5000);
+        await new Promise<void>((resolve, reject) => {
+          const backup = (source as BackupDatabase).backup(snapshotPath, error => {
+            if (error) return reject(error);
+            backup.step(-1, (stepError, complete) => {
+              backup.finish(() => {
+                if (stepError) reject(stepError);
+                else if (!complete) reject(new Error('SQLite backup did not complete'));
+                else resolve();
+              });
+            });
+          });
+        });
+      } finally {
+        await this.closeSnapshotConnection(source);
+      }
+
+      this.assertSQLiteHeader(snapshotPath);
+      const snapshot = await this.openReadOnlyDatabase(snapshotPath);
+      try {
+        const result = await this.query(snapshot, 'PRAGMA integrity_check');
+        if (result.rows.length !== 1 || result.rows[0].integrity_check !== 'ok') {
+          throw new Error('SQLite backup integrity validation failed');
+        }
+      } finally {
+        await this.closeSnapshotConnection(snapshot);
+      }
+      chmodSync(snapshotPath, 0o600);
+      this.assertNewDatabaseDestination(destination);
+      linkSync(snapshotPath, destination);
+    } finally {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   }
 

@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - **Semantic Search**: Fast, localized RAG matching via SQLite's native FTS5 extension (`MATCH` and `bm25()` ranking) across entity names, types, and observations
 - **Per-Project Memory**: Each project gets its own `memory.db`. The server resolves the project root in this order: the `GUARDIAN_PROJECT_ROOT` environment variable, then the Git toplevel of its working directory, then `$XDG_DATA_HOME/project-guardian` as a shared fallback outside any Git repository
 - **Central Memory Mirror**: Every memory write also syncs into one central database at `~/memory/memory.db`, giving an aggregated, searchable map across all projects and a fallback when a project database is unavailable. Reads through `read_graph` and `search_nodes` merge both stores, with project entries taking precedence
-- **Daily Central Backups**: On the first sync of each day, the central database is snapshotted to `~/memory/backup/ddmmyyyy_memory.db`; the seven most recent backups are kept and older ones pruned automatically. On first run, a legacy `~/memory.db` in the home directory is migrated into the new layout and used to seed the first backup
+- **Daily Central Backups**: On the first sync of each day, the central database is snapshotted with SQLite's online backup API and integrity-checked before publication to `~/memory/backup/ddmmyyyy_memory.db`; the seven most recent backups are kept. Legacy `~/memory.db` migration uses the same snapshot procedure and retains the original for recovery.
 - **On-Demand Pre-Commit Setup**: Nothing is installed at startup. Call `setup_pre_commit` when you want a generated `.pre-commit-config.yaml` and Git hooks in the active project
 
 - **Optional Obsidian Vault Mirror**: When `HELA_GENOME_OBSIDIAN_VAULT` is set, entity/relation/observation writes are mirrored as Markdown notes with YAML frontmatter into an Obsidian vault, so humans can browse and edit project memory in Obsidian (graph view, backlinks). SQLite remains the base engine; the web UI dashboard has been removed in favor of Obsidian.
@@ -75,7 +75,7 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - **Core CRUD**: Essential database operations (query, insert, update, delete)
 - **SQL Execution**: Direct SQL query execution
 - **Data Transfer**: Import/export CSV and JSON files
-- **25 Canonical Tools + 14 Legacy Aliases**: Seven database tools, nine memory/guidance tools (`initialize_memory`, `memory_edit`, `read_graph`, `read_graph_stream`, `search_nodes`, `open_node`, `get_file_context`, `get_timeline`, `get_project_guidance`), three fleet mission tools (`create_mission`, `list_missions`, `update_mission`), and nine runtime tools (`sync_central_memory`, `set_project_root`, `setup_pre_commit`, `get_session_context`, `analyze_git_changes`, `inspect_untrusted_text`, `security_scan`, `cache`, `harness_sessions`). The view-only Web UI dashboard has been removed in favor of the optional Obsidian vault mirror. Legacy names such as `create_entity` remain as deprecated aliases that normalize to canonical actions
+- **29 Canonical Tools + Legacy Aliases**: Seven database tools, nine memory/guidance tools (`initialize_memory`, `memory_edit`, `read_graph`, `read_graph_stream`, `search_nodes`, `open_node`, `get_file_context`, `get_timeline`, `get_project_guidance`), three fleet mission tools (`create_mission`, `list_missions`, `update_mission`), and ten runtime tools (including `obsidian_vault`). The view-only Web UI dashboard has been removed in favor of the optional Obsidian vault mirror. Legacy names such as `create_entity` remain as deprecated aliases that normalize to canonical actions.
 
 ### Runtime Companion Integration
 
@@ -369,7 +369,7 @@ Invoke a project guidance framework to receive specialized instructions and chec
 
 ### Fleet Mission Ledger Tools (3 tools)
 
-Coordinate tasks and multi-agent workflows across swarms or fleets with an atomic SQLite-backed mission board. Designed for distributed agents (e.g. local desktop and remote servers) to share tasks without heavy broker infrastructure.
+Coordinate agents through a SQLite-backed mission board. Claims are exclusive across connections and processes using the **same SQLite database**. Agents on different machines must call the same server/ledger endpoint to coordinate; separate local databases, central graph synchronization, and vault synchronization do not provide a distributed lock or replicate missions.
 
 #### `create_mission`
 Enqueue a mission into the fleet mission ledger. Supports assigning to specific agent targets (`frea`, `mema`, `orchestrator`, `human`, or `any`), priorities (`low`, `normal`, `high`, `urgent`), and arbitrary JSON payloads.
@@ -397,12 +397,12 @@ Query missions from the ledger filtered by status, agent target, origin, or clai
 - `database` (optional, default: `project`): `project` | `central`
 
 #### `update_mission`
-Claim a mission or report its lifecycle progress (e.g. marking `completed` with output results, or `failed` with an error message). Automatically records timestamps (`claimed_at`, `completed_at`, `updated_at`).
+Claim a queued, unowned mission or report its lifecycle progress (e.g. marking `completed` with output results, or `failed` with an error message). Automatically records timestamps (`claimed_at`, `completed_at`, `updated_at`). A claim uses one conditional SQL update; competing claimants receive an error rather than replacing the winner.
 
 **Parameters:**
 - `id` (required): Mission ID to update
 - `status` (optional): New status
-- `claimedBy` (optional): Agent claiming the mission
+- `claimedBy` (optional): Non-empty agent name, up to 100 characters. Supplying it attempts an exclusive claim, optionally with `status: claimed` or `status: in_progress`. Do not repeat it on subsequent lifecycle updates; claimant reassignment and claimant-free `status: claimed` are rejected.
 - `result` (optional): JSON result or return value upon completion
 - `error` (optional): Error message if mission failed
 - `database` (optional, default: `project`): `project` | `central`
@@ -410,7 +410,7 @@ Claim a mission or report its lifecycle progress (e.g. marking `completed` with 
 ### Runtime Companion Tools (12 tools)
 
 #### `sync_central_memory`
-Copy the active project knowledge graph into the central memory database (`~/memory/memory.db` by default, override with `GUARDIAN_CENTRAL_DB`). Entities are upserted and relations deduplicated, so the central database accumulates a searchable map across all projects. Every memory write also syncs automatically; call this tool to force a sync on demand. The first sync of each day also snapshots the central database and prunes old backups beyond the newest seven.
+Merge the active project knowledge graph into the central memory database (`~/memory/memory.db` by default, override with `GUARDIAN_CENTRAL_DB`). Observation unions preserve independent facts and their existing order; entity type follows the newer timestamp, and relations are unique by endpoints/type. Central imports use the same additive merge instead of overwriting local observations. Every memory write also syncs automatically; call this tool to force a sync on demand. The first sync of each day also snapshots the central database and prunes old backups beyond the newest seven. Central memory remains an aggregate, not a deletion-propagating replica or a mission ledger synchronizer.
 
 #### `set_project_root`
 Switch the active project memory database to the given absolute project path. Use this at session start when the server was launched outside the project directory, so memory is written to the project instead of the shared fallback database.
@@ -466,25 +466,41 @@ Project scan paths are restricted to the current Git workspace. Redis tools conn
 
 ### Obsidian Vault Mirror (optional, remote-capable, agent-controllable)
 
-Set `HELA_GENOME_OBSIDIAN_VAULT=/path/to/vault` to mirror entity/relation/observation writes as Markdown notes with YAML frontmatter into an Obsidian vault. SQLite remains the base engine; the web UI dashboard has been removed in favor of Obsidian. The vault is the source of truth across machines; SQLite rebuilds from it on startup.
+Set `HELA_GENOME_OBSIDIAN_VAULT=/path/to/vault` to enable the optional Markdown mirror. SQLite remains the base engine; no Obsidian service is required. Startup imports managed entity and relation notes without clearing SQLite. Only bullets in `## Observations` are facts; generated `## Relations` backlinks are never imported as observations. Repeated imports are idempotent and retain junk/test-memory guards.
 
-**MCP tool:** `obsidian_vault` (action: `status`, `sync`, `rebuild`, `backfill`) — agents can inspect and control the mirror directly.
+**MCP tool:** `obsidian_vault` supports `status`, `sync`, `rebuild`, `backfill`, `sync_central`, `sync_from_central`, and `dedup`. Rebuild imports notes, not a live database-file replacement. Local deduplication preserves edges/provenance and remembers aliases so central imports do not recreate merged names.
 
-Set `HELA_GENOME_OBSIDIAN_VAULT=/path/to/vault` to mirror entity/relation/observation writes as Markdown notes with YAML frontmatter into an Obsidian vault. SQLite remains the base engine; the web UI dashboard has been removed in favor of Obsidian. The vault can live on another machine — use the sync hooks below.
+The watcher polls every two seconds and serializes imports. Human observation changes replace the rendered baseline only if SQLite still matches it; divergent agent/human edits merge their observations. Previous note revisions are retained under `.hela-conflicts/`. Hidden directories are excluded from imports. Deletions are inferred only for notes previously observed by that running watcher, using frontmatter identity; a missing or unreadable vault fails closed. Absence on startup is not a deletion instruction. Central memory is additive: a later explicit central import may restore a project-deleted entity.
 
-- **Env var:** `HELA_GENOME_OBSIDIAN_VAULT` — local path (can be a mount point / synced folder).
-- **Remote push:** `HELA_GENOME_OBSIDIAN_SYNC_CMD` — shell command run after each write (e.g. `rsync -a /vault/ user@host:/vault/` or `git -C /vault add -A && git -C /vault commit -m sync && git -C /vault push`).
-- **Remote pull:** `HELA_GENOME_OBSIDIAN_PULL_CMD` — shell command run on startup (e.g. `git -C /vault pull --rebase`).
+#### Conflict-aware synchronization between machines
 
-**Example (self-hosted Obsidian on `servy`):**
+Build with `npm run build`, then configure both legacy hook names to the same **two-way** transport. The pull hook runs asynchronously at startup and before explicit sync; the write hook is debounced and serialized. Hook failures reach explicit callers; background failures are logged without printing command contents. Legacy `rsync --delete` hooks are rejected.
+
 ```bash
-HELA_GENOME_OBSIDIAN_VAULT=/home/azzar/obsidian-vaults/hela-genome
-HELA_GENOME_OBSIDIAN_PULL_CMD="rsync -a --delete servy:/home/ubuntu/projects/obsidian/web/vaults/hela-genome/ /home/azzar/obsidian-vaults/hela-genome/"
-HELA_GENOME_OBSIDIAN_SYNC_CMD="rsync -a --delete /home/azzar/obsidian-vaults/hela-genome/ servy:/home/ubuntu/projects/obsidian/web/vaults/hela-genome/"
+export HELA_GENOME_OBSIDIAN_VAULT=/path/to/local/vault
+export HELA_GENOME_OBSIDIAN_PULL_CMD="node /path/to/project-mcp/dist/vault-sync.js --vault /path/to/local/vault --peer /path/to/remote/vault --remote user@host"
+export HELA_GENOME_OBSIDIAN_SYNC_CMD="$HELA_GENOME_OBSIDIAN_PULL_CMD"
 ```
-The vault on servy is exposed via Obsidian Web (`https://obsidian.hela.my.id`) and LiveSync (`https://obsidian-sync.hela.my.id`), so notes written by hela-genome appear in your browser/mobile Obsidian automatically.
-- **Bidirectional:** vault edits (new/modified/deleted notes) sync back to SQLite via a 2s polling watcher.
-- **Optional:** system works without Obsidian (vault mirror is a no-op when unset).
+
+Both directories must already exist. The peer requires SSH access and Node.js, but not an installed Genome server or helper. Omit `--remote` to test two local vault directories.
+
+- First sync unions missing files; it never treats initial absence as deletion.
+- A shared hash baseline permits one-sided edits and deletions only when the other side is unchanged. Divergent edits and edit/delete conflicts leave both canonical states untouched and archive both available revisions plus deletion intent in `.hela-sync/conflicts/` on both machines.
+- Overwritten or deleted revisions are retained in `.hela-sync/recovery/`. Archives contain `.bin` content plus JSON path/hash records. Resolve conflicts by copying the chosen/merged content to both canonical paths, or deleting both copies, then rerun sync.
+- Exit codes: `0` synchronized, `2` unresolved conflicts, `1` failed/unavailable. Missing peers, corrupt metadata, and failed SSH commands are not empty snapshots.
+- Locks serialize cooperating synchronizers; expected-hash checks reject stale snapshots. Editors do not honor these locks, so do not treat this as a distributed filesystem transaction. Interrupted or mismatched baselines fall back to conservative reconciliation. Recovery archives preserve replaced data.
+- Non-hidden regular files, including attachments, are managed; `.obsidian/`, `.hela-sync/`, and other hidden paths are excluded. Symlinks, hardlinks, overlapping local roots, and oversized snapshots are rejected. Default transport limit is 32 MiB per operation with a conservative snapshot budget; the exported API accepts up to 64 MiB.
+- Keep each vault's `.hela-sync/id` and state local; do not clone these metadata files between peers. A stale `.hela-sync/lock` fails closed. Remove only that specific lock after confirming its owning sync process is no longer running; do not erase the baseline to force a deletion.
+
+Run `npm test -- --runInBand` for isolated coverage. `node scripts/test-vault-sync-ssh.mjs user@host` checks create/edit/delete conflicts and recovery using disposable directories on both hosts; it never uses the configured production vault.
+
+### SQLite backup and isolated restore
+
+`SQLiteManager.backupDatabase(database, backupPath)` uses SQLite's online backup API, includes committed WAL data, verifies the SQLite header and `PRAGMA integrity_check`, and publishes a closed snapshot atomically without overwriting an existing destination. Daily central backups and legacy migration use this implementation.
+
+`SQLiteManager.restoreDatabase(backupPath, newDatabaseNameOrAbsolutePath)` restores **only to a new destination** after validation. Existing database files, active connections, aliases to existing targets, and SQLite sidecars are refused. A successful isolated restore is evidence that the backup is readable; it is not authorization to overwrite production storage.
+
+For production recovery: stop every writer, take a fresh recovery backup, restore under a new name, verify integrity and expected records, then explicitly switch the service configuration to that restored database. Retain the old database and its WAL/SHM as a coordinated offline recovery set. Never copy over an active SQLite database or delete its sidecars to force a restore.
 
 ## AI Guidance System
 

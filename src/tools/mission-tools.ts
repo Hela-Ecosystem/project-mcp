@@ -37,13 +37,13 @@ export const missionTools: Tool[] = [
   },
   {
     name: 'update_mission',
-    description: 'Update mission status, claim a mission, or report execution result/failure',
+    description: 'Update mission status or results. Claim queued missions exclusively with claimedBy (status claimed or in_progress); existing claims cannot be reassigned.',
     inputSchema: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Mission ID to update' },
         status: { type: 'string', enum: ['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled'], description: 'New mission status' },
-        claimedBy: { type: 'string', description: 'Agent claiming or executing the mission' },
+        claimedBy: { type: 'string', minLength: 1, maxLength: 100, pattern: '\\S', description: 'Agent exclusively claiming a queued mission; omit for subsequent lifecycle updates' },
         result: { type: 'object', description: 'Output data or result report upon completion' },
         error: { type: 'string', description: 'Error message if mission failed' },
         database: { type: 'string', enum: ['project', 'central'], default: 'project', description: 'Target database (project or central)' }

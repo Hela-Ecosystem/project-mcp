@@ -1,6 +1,7 @@
 import { SQLiteManager } from './sqlite-manager.js';
 import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
-import { ObsidianVaultMirror } from './obsidian-vault.js';
+import { ObsidianVaultMirror, uniqueObservations, observationHash } from './obsidian-vault.js';
+import { createHash } from 'crypto';
 import { sanitizePrivateContent } from './utils/sanitize.js';
 import {
   ObservationProvenance,
@@ -27,11 +28,17 @@ export class MemoryManager {
   private centralDbPath: string;
   private obsidianMirror!: ObsidianVaultMirror;
   private vaultWatcher: NodeJS.Timeout | null = null;
-  private vaultMtimes: Map<string, number> = new Map();
+  private vaultNotes = new Map<string, { hash: string; name: string; version: string }>();
+  private vaultRelations = new Map<string, { from: string; to: string; relationType: string; createdAt: string }>();
+  private vaultSync: Promise<void> | null = null;
 
   constructor(sqliteManager: SQLiteManager, targetRoot?: string) {
     this.sqliteManager = sqliteManager;
     this.targetRoot = targetRoot ?? process.cwd();
+    const configured = process.env.GUARDIAN_CENTRAL_DB;
+    this.centralDbPath = (configured && isAbsolute(configured))
+      ? resolve(configured)
+      : path.join(homedir(), 'memory', 'memory.db');
     this.obsidianMirror = new ObsidianVaultMirror();
     if (process.env.NODE_ENV !== 'test') {
       (async () => {
@@ -40,19 +47,17 @@ export class MemoryManager {
         try { await this.syncFromCentral(); } catch (e) { void e; }
         if (this.obsidianMirror.isEnabled()) {
           console.error('[obsidian] scheduling sync');
-          // Vault is source of truth: pull already ran in constructor; rebuild SQLite from vault
+          try { await this.obsidianMirror.pullSync(); }
+          catch (error) { console.error('[obsidian] remote sync unavailable:', (error as Error).message); }
           await this.rebuildFromVault();
           // Backfill: mirror any SQLite-only entities to vault, then push
-          await this.backfillVault();
+          try { await this.backfillVault(); }
+          catch (error) { console.error('[obsidian] backfill sync unavailable:', (error as Error).message); }
           this.startVaultWatcher();
           console.error('[obsidian] sync done');
         }
       })().catch((e) => { console.error('[obsidian] sync error', e); });
     }
-    const configured = process.env.GUARDIAN_CENTRAL_DB;
-    this.centralDbPath = (configured && isAbsolute(configured))
-      ? resolve(configured)
-      : path.join(homedir(), 'memory', 'memory.db');
   }
 
   private async ensureFtsSchema(dbName: string): Promise<void> {
@@ -182,6 +187,15 @@ export class MemoryManager {
         { name: 'idx_relations_type', columns: ['relation_type'] }
       ]
     });
+    const dedup = await this.sqliteManager.executeSql(this.memoryDbName,
+      'DELETE FROM relations WHERE id NOT IN (SELECT MIN(id) FROM relations GROUP BY from_entity, to_entity, relation_type)');
+    if (!dedup.success) throw new Error(dedup.error || 'Relation deduplication failed');
+    const unique = await this.sqliteManager.executeSql(this.memoryDbName,
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON relations(from_entity, to_entity, relation_type)');
+    if (!unique.success) throw new Error(unique.error || 'Relation uniqueness index failed');
+    const aliases = await this.sqliteManager.executeSql(this.memoryDbName,
+      'CREATE TABLE IF NOT EXISTS entity_aliases(alias TEXT PRIMARY KEY, canonical_name TEXT NOT NULL)');
+    if (!aliases.success) throw new Error(aliases.error);
     const r1 = await this.sqliteManager.executeSql(this.memoryDbName, 'CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type)');
     if (!r1.success) console.warn('Failed to create entity type index:', r1.error);
     const r2 = await this.sqliteManager.executeSql(this.memoryDbName, 'CREATE INDEX IF NOT EXISTS idx_entities_updated ON entities(updated_at)');
@@ -229,7 +243,7 @@ export class MemoryManager {
       for (const entity of graph.entities) {
         const r = await this.sqliteManager.executeSql(
           this.centralDbPath,
-          `INSERT OR REPLACE INTO entities (name, entity_type, observations, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+          this.mergeEntitySql(),
           [entity.name, entity.entityType, JSON.stringify(entity.observations), entity.createdAt, entity.updatedAt]
         );
         if (!r.success) throw new Error(r.error);
@@ -286,55 +300,70 @@ export class MemoryManager {
     try {
       const centEntities = await this.sqliteManager.queryData(this.centralDbPath, 'entities', {}, 10000, 0, 'updated_at', 'DESC');
       const centRelations = await this.sqliteManager.queryData(this.centralDbPath, 'relations', {}, 10000, 0);
+      const aliasResult = await this.sqliteManager.queryData(this.memoryDbName, 'entity_aliases', {}, 100000);
+      if (!aliasResult.success) throw new Error(aliasResult.error);
+      const aliases = new Map<string, string>((aliasResult.data?.rows || []).map((row: any) => [row.alias, row.canonical_name]));
+      const centralRelations: Relation[] = (centRelations.data?.rows || []).map((row: any) => this.rowToRelation(row));
       if (centEntities.success && centEntities.data) {
         for (const row of centEntities.data.rows as any[]) {
           const ent = this.rowToEntity(row);
-          const existing = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name: ent.name });
-          const now = new Date().toISOString();
-          if (existing.success && existing.data && existing.data.rows.length > 0) {
-            await this.sqliteManager.updateData(this.memoryDbName, 'entities', { name: ent.name }, {
-              entity_type: ent.entityType,
-              observations: JSON.stringify(ent.observations),
-              updated_at: now,
-            });
-          } else {
-            try {
-              await this.sqliteManager.insertData(this.memoryDbName, 'entities', [{
-                name: ent.name,
-                entity_type: ent.entityType,
-                observations: JSON.stringify(ent.observations),
-                created_at: ent.createdAt,
-                updated_at: now,
-              }]);
-            } catch (e) { void e; }
-          }
+          ent.observations = this.cleanObservations(ent, centralRelations);
+          ent.name = aliases.get(ent.name) || ent.name;
+          const result = await this.sqliteManager.executeSql(this.memoryDbName, this.mergeEntitySql(),
+            [ent.name, ent.entityType, JSON.stringify(ent.observations), ent.createdAt, ent.updatedAt]);
+          if (!result.success) throw new Error(result.error);
           eCount++;
         }
       }
       if (centRelations.success && centRelations.data) {
         for (const row of centRelations.data.rows as any[]) {
           const rel = this.rowToRelation(row);
-          try {
-            await this.sqliteManager.insertData(this.memoryDbName, 'relations', [{
-              from_entity: rel.from,
-              to_entity: rel.to,
-              relation_type: rel.relationType,
-              created_at: rel.createdAt,
-            }]);
-            rCount++;
-          } catch (e) { void e; } // ignore duplicates
+          rel.from = aliases.get(rel.from) || rel.from;
+          rel.to = aliases.get(rel.to) || rel.to;
+          const result = await this.sqliteManager.executeSql(this.memoryDbName,
+            'INSERT OR IGNORE INTO relations(from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)',
+            [rel.from, rel.to, rel.relationType, rel.createdAt]);
+          if (!result.success) throw new Error(result.error);
+          rCount += result.data?.changes || 0;
         }
       }
-    } catch (e) { void e; }
+    } catch (e) { throw new Error(`Central memory import failed: ${(e as Error).message}`); }
     return { entities: eCount, relations: rCount };
+  }
+
+  private mergeEntitySql(): string {
+    return `INSERT INTO entities(name, entity_type, observations, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET
+        entity_type = CASE WHEN excluded.updated_at > entities.updated_at THEN excluded.entity_type ELSE entities.entity_type END,
+        observations = (SELECT json_group_array(value) FROM (
+          SELECT value FROM (
+            SELECT value, CAST(key AS INTEGER) AS position FROM json_each(entities.observations)
+            UNION ALL SELECT value, json_array_length(entities.observations) + CAST(key AS INTEGER)
+            FROM json_each(excluded.observations))
+          GROUP BY value ORDER BY MIN(position))),
+        created_at = MIN(entities.created_at, excluded.created_at),
+        updated_at = MAX(entities.updated_at, excluded.updated_at)`;
+  }
+
+  private cleanObservations(entity: Entity, relations: Array<{ from: string; to: string; relationType: string }>): string[] {
+    const annotations = new Set<string>();
+    for (const relation of relations) {
+      if (relation.from === entity.name) annotations.add(`[[${relation.to}]] — ${relation.relationType}`);
+      if (relation.to === entity.name) annotations.add(`[[${relation.from}]] — ${relation.relationType} (incoming)`);
+    }
+    return uniqueObservations(entity.observations.filter(observation => !annotations.has(observation.trim())));
   }
 
   async dedupEntities(): Promise<{ merged: number; removed: number }> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     let merged = 0, removed = 0;
+    const changedEntities: Entity[] = [];
+    const removedNames: string[] = [];
+    const begin = await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN IMMEDIATE');
+    if (!begin.success) throw new Error(begin.error || 'Could not begin deduplication');
     try {
       const res = await this.sqliteManager.queryData(this.memoryDbName, 'entities', {}, 100000, 0, 'updated_at', 'DESC');
-      if (!res.success || !res.data) return { merged, removed };
+      if (!res.success || !res.data) throw new Error(res.error || 'Could not read entities');
       const entities = res.data.rows.map((row: any) => this.rowToEntity(row));
       // group by normalized name
       const groups = new Map<string, Entity[]>();
@@ -344,26 +373,70 @@ export class MemoryManager {
         groups.get(key)!.push(e);
       }
       for (const [, group] of groups) {
-        if (group.length < 2) continue;
         // keep the first (earliest created), merge observations into it
         const survivor = group.reduce((a, b) => (a.createdAt <= b.createdAt ? a : b));
         const allObs = new Set<string>();
-        for (const e of group) for (const o of e.observations) allObs.add(o);
+        for (const e of group) {
+          const relations = await this.getRelationsForEntity(e.name);
+          for (const o of this.cleanObservations(e, relations)) allObs.add(o);
+        }
         const mergedObs = [...allObs];
-        // update survivor
-        await this.sqliteManager.updateData(this.memoryDbName, 'entities', { name: survivor.name }, {
+        const updatedAt = new Date().toISOString();
+        const update = await this.sqliteManager.updateData(this.memoryDbName, 'entities', { name: survivor.name }, {
           observations: JSON.stringify(mergedObs),
-          updated_at: new Date().toISOString(),
+          updated_at: updatedAt,
         });
-        merged++;
+        if (!update.success) throw new Error(update.error);
+        changedEntities.push({ ...survivor, observations: mergedObs, updatedAt });
+        if (group.length > 1) merged++;
         // delete the others
         for (const e of group) {
           if (e.name === survivor.name) continue;
-          await this.sqliteManager.deleteData(this.memoryDbName, 'entities', { name: e.name });
+          const alias = await this.sqliteManager.executeSql(this.memoryDbName,
+            'INSERT INTO entity_aliases(alias, canonical_name) VALUES (?, ?) ON CONFLICT(alias) DO UPDATE SET canonical_name=excluded.canonical_name',
+            [e.name, survivor.name]);
+          if (!alias.success) throw new Error(alias.error);
+          const retarget = await this.sqliteManager.executeSql(this.memoryDbName,
+            'UPDATE entity_aliases SET canonical_name=? WHERE canonical_name=?', [survivor.name, e.name]);
+          if (!retarget.success) throw new Error(retarget.error);
+          const moved = await this.sqliteManager.executeSql(this.memoryDbName,
+            `INSERT OR IGNORE INTO relations(from_entity, to_entity, relation_type, created_at)
+             SELECT CASE WHEN from_entity=? THEN ? ELSE from_entity END,
+                    CASE WHEN to_entity=? THEN ? ELSE to_entity END, relation_type, created_at
+             FROM relations WHERE from_entity=? OR to_entity=?`,
+            [e.name, survivor.name, e.name, survivor.name, e.name, e.name]);
+          if (!moved.success) throw new Error(moved.error);
+          const provenance = await this.sqliteManager.executeSql(this.memoryDbName,
+            `INSERT OR IGNORE INTO observation_provenance(entity_name, observation, source, retrieved_at, confidence, freshness)
+             SELECT ?, observation, source, retrieved_at, confidence, freshness FROM observation_provenance WHERE entity_name=?`,
+            [survivor.name, e.name]);
+          if (!provenance.success) throw new Error(provenance.error);
+          const operations = [
+            this.sqliteManager.deleteData(this.memoryDbName, 'relations', { from_entity: e.name }),
+            this.sqliteManager.deleteData(this.memoryDbName, 'relations', { to_entity: e.name }),
+            this.sqliteManager.deleteData(this.memoryDbName, 'observation_provenance', { entity_name: e.name }),
+            this.sqliteManager.executeSql(this.memoryDbName, 'DELETE FROM vec_entities WHERE rowid IN (SELECT rowid FROM entities WHERE name=?)', [e.name]),
+          ];
+          for (const result of await Promise.all(operations)) if (!result.success) throw new Error(result.error);
+          const deletion = await this.sqliteManager.deleteData(this.memoryDbName, 'entities', { name: e.name });
+          if (!deletion.success) throw new Error(deletion.error);
+          removedNames.push(e.name);
           removed++;
         }
       }
-    } catch (e) { void e; }
+      const commit = await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      if (!commit.success) throw new Error(commit.error);
+    } catch (error) {
+      await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK');
+      throw error;
+    }
+    for (const name of removedNames) this.obsidianMirror.removeEntity(name);
+    for (const entity of changedEntities) {
+      await this.upsertVec(this.memoryDbName, entity.name, `${entity.name} ${entity.entityType} ${entity.observations.join(' ')}`);
+      this.obsidianMirror.syncEntity(entity, await this.getRelationsForEntity(entity.name));
+    }
+    const graph = await this.readStore(this.memoryDbName, { limit: 100000 });
+    for (const relation of graph.relations) this.obsidianMirror.syncRelation(relation);
     await this.syncToCentralSafe();
     return { merged, removed };
   }
@@ -411,7 +484,8 @@ export class MemoryManager {
 
     try {
       fs.mkdirSync(dirname(this.centralDbPath), { recursive: true });
-      fs.copyFileSync(legacyPath, this.centralDbPath);
+      const migration = await this.sqliteManager.backupDatabase(legacyPath, this.centralDbPath);
+      if (!migration.success) throw new Error(migration.error || 'Central memory snapshot failed');
 
       // Verify the copy is readable before touching the original
       const probe = await this.sqliteManager.executeSql(this.centralDbPath, 'SELECT COUNT(*) as count FROM entities');
@@ -422,12 +496,12 @@ export class MemoryManager {
       fs.mkdirSync(this.getBackupDir(), { recursive: true });
       const seedBackup = joinPath(this.getBackupDir(), MemoryManager.buildBackupName(new Date()));
       if (!fs.existsSync(seedBackup)) {
-        fs.copyFileSync(legacyPath, seedBackup);
+        const backup = await this.sqliteManager.backupDatabase(this.centralDbPath, seedBackup);
+        if (!backup.success) throw new Error(backup.error || 'Central memory seed backup failed');
         this.pruneBackupsSync();
       }
 
-      fs.unlinkSync(legacyPath);
-      console.error(`Migrated central memory from ${legacyPath} to ${this.centralDbPath}`);
+      console.error(`Migrated central memory to ${this.centralDbPath}; retained legacy database for recovery`);
     } catch (err) {
       console.error(`Central memory migration failed; continuing with legacy path ${legacyPath}:`, err);
       this.centralDbPath = legacyPath;
@@ -455,8 +529,8 @@ export class MemoryManager {
 
       const todayBackup = joinPath(backupDir, MemoryManager.buildBackupName(new Date()));
       if (!fs.existsSync(todayBackup)) {
-        const escaped = todayBackup.replace(/'/g, "''");
-        await this.sqliteManager.executeSql(this.centralDbPath, `VACUUM INTO '${escaped}'`);
+        const backup = await this.sqliteManager.backupDatabase(this.centralDbPath, todayBackup);
+        if (!backup.success) throw new Error(backup.error || 'Central memory backup failed');
       }
       this.pruneBackupsSync();
     } catch (err) {
@@ -657,7 +731,8 @@ export class MemoryManager {
       throw new Error(`Entity '${name}' already exists`);
     }
 
-    const sanitizedObservations = observations.map(o => sanitizePrivateContent(o));
+    const sanitizedInputs = observations.map(o => sanitizePrivateContent(o).trim());
+    const sanitizedObservations = uniqueObservations(sanitizedInputs);
     const observationsJson = JSON.stringify(sanitizedObservations);
 
     const insertResult = await this.sqliteManager.insertData(this.memoryDbName, 'entities', [{
@@ -677,7 +752,7 @@ export class MemoryManager {
     await this.upsertVec(this.memoryDbName, name, text);
 
     // P1-C2: provenance sidecar (best-effort, never fails the create)
-    await recordObservationProvenance(this.sqliteManager, this.memoryDbName, name, sanitizedObservations, provenance);
+    await recordObservationProvenance(this.sqliteManager, this.memoryDbName, name, sanitizedInputs, provenance);
 
     // Obsidian vault mirror (best-effort) — include relations for graph edges
     const entityRelations = await this.getRelationsForEntity(name);
@@ -785,7 +860,6 @@ export class MemoryManager {
     };
   }
 
-  /** Sync a single vault note into SQLite (upsert). */
   private async getRelationsForEntity(name: string): Promise<Array<{ from: string; to: string; relationType: string }>> {
     try {
       const r = await this.sqliteManager.executeSql(this.memoryDbName, `SELECT from_entity, to_entity, relation_type FROM relations WHERE from_entity=? OR to_entity=?`, [name, name]);
@@ -796,130 +870,141 @@ export class MemoryManager {
     return [];
   }
 
-  private async syncVaultNoteToSqlite(filename: string): Promise<void> {
+  private async syncVaultNoteToSqlite(filename: string, content: string): Promise<void> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const vault = this.obsidianMirror;
-    const content = vault.readNote(filename);
-    if (content === null) return;
     const parsed = vault.parseNote(content);
     if (!parsed) return;
     if (this.isJunkEntity(parsed.name, parsed.observations)) return;
-    const { name, entityType, observations } = parsed;
+    const { name } = parsed;
+    const relations = await this.getRelationsForEntity(name);
+    let entityType = parsed.entityType;
+    let observations = this.cleanObservations({ ...parsed, createdAt: '', updatedAt: '' }, relations)
+      .map(value => sanitizePrivateContent(value));
     const existing = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name });
+    if (!existing.success) throw new Error(existing.error);
     const now = new Date().toISOString();
+    let updatedAt = now;
+    let createdAt = parsed.createdAt && !isNaN(Date.parse(parsed.createdAt)) ? parsed.createdAt : now;
     if (existing.success && existing.data && existing.data.rows.length > 0) {
-      const row = existing.data.rows[0] as { entity_type: string; observations: string };
-      const current = this.safeParseObservations(row.observations);
-      // only update if changed
+      const row = existing.data.rows[0];
+      const current = this.cleanObservations(this.rowToEntity(row), relations);
+      createdAt = row.created_at;
+      updatedAt = row.updated_at;
+      const matchesBase = parsed.mirrorHash
+        ? parsed.mirrorHash === observationHash({ entityType: row.entity_type, observations: current })
+        : parsed.updatedAt === row.updated_at;
+      if (!matchesBase) {
+        observations = uniqueObservations([...current, ...observations]);
+        entityType = row.entity_type;
+      }
       const changed = row.entity_type !== entityType || JSON.stringify(current) !== JSON.stringify(observations);
-      if (changed) {
-        await this.sqliteManager.updateData(this.memoryDbName, 'entities', { name }, {
+      if (changed || JSON.stringify(this.safeParseObservations(row.observations)) !== JSON.stringify(observations)) {
+        updatedAt = now;
+        const update = await this.sqliteManager.updateData(this.memoryDbName, 'entities', {
+          name, updated_at: row.updated_at, observations: row.observations, entity_type: row.entity_type,
+        }, {
           entity_type: entityType,
           observations: JSON.stringify(observations),
-          updated_at: now,
+          updated_at: updatedAt,
         });
+        if (!update.success || update.data?.changes !== 1) throw new Error('Vault import changed concurrently; retry sync');
       }
     } else {
-      // create
-      try {
-        await this.sqliteManager.insertData(this.memoryDbName, 'entities', [{
+      const insert = await this.sqliteManager.insertData(this.memoryDbName, 'entities', [{
           name,
           entity_type: entityType,
           observations: JSON.stringify(observations),
-          created_at: now,
-          updated_at: now,
-        }]);
-      } catch (e) { void e; }
+          created_at: createdAt,
+          updated_at: updatedAt,
+      }]);
+      if (!insert.success) throw new Error(insert.error);
     }
-  }
-
-  /** Remove an entity from SQLite if its vault note was deleted. */
-  private async removeVaultNoteFromSqlite(name: string): Promise<void> {
-    if (!this.projectSchemaReady) await this.ensureProjectSchema();
-    try {
-      await this.sqliteManager.deleteData(this.memoryDbName, 'entities', { name });
-    } catch (e) { void e; }
+    await this.upsertVec(this.memoryDbName, name, `${name} ${entityType} ${observations.join(' ')}`);
+    if (vault.readNote(filename) !== content) throw new Error('Vault note changed during import; retry sync');
+    vault.syncEntity({ name, entityType, observations, createdAt, updatedAt }, relations, true, filename);
+    const currentContent = vault.readNote(filename);
+    if (currentContent === null) throw new Error('Vault note disappeared during import');
+    const mirrored = vault.parseNote(currentContent);
+    if (!mirrored || observationHash(mirrored) !== observationHash({ entityType, observations })) {
+      throw new Error('Vault note changed before publication; retry sync');
+    }
+    this.vaultNotes.set(filename, {
+      hash: createHash('sha256').update(currentContent).digest('hex'), name,
+      version: observationHash({ entityType, observations }),
+    });
   }
 
   /** Poll the vault for changes and sync to SQLite. */
   private async syncVaultToSqlite(): Promise<void> {
+    if (this.vaultSync) return this.vaultSync;
+    this.vaultSync = this.importVaultSnapshot();
+    try { await this.vaultSync; }
+    finally { this.vaultSync = null; }
+  }
+
+  private async importVaultSnapshot(): Promise<void> {
     const vault = this.obsidianMirror;
     if (!vault.isEnabled()) return;
     const vaultPath = vault.getVaultPath();
     if (!vaultPath) return;
-    try {
+    if (!this.projectSchemaReady) await this.ensureProjectSchema();
       const files = vault.listNotes();
+      const snapshot = new Map<string, string>();
+      for (const filename of files) {
+        const content = vault.readNote(filename);
+        if (content === null) throw new Error('Incomplete vault snapshot; no deletions applied');
+        snapshot.set(filename, content);
+      }
       const currentSet = new Set(files);
-      // detect deletions
-      for (const [fname] of this.vaultMtimes) {
+      for (const [filename, relation] of this.vaultRelations) {
+        if (!currentSet.has(filename)) {
+          await this.deleteRelation(relation.from, relation.to, relation.relationType);
+          this.vaultRelations.delete(filename);
+        }
+      }
+      for (const [fname, previous] of this.vaultNotes) {
         if (!currentSet.has(fname)) {
-          const parsed = null;
-          // derive name from filename
-          const name = fname.replace(/\.md$/, '');
-          await this.removeVaultNoteFromSqlite(name);
-          this.vaultMtimes.delete(fname);
+          const existing = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name: previous.name });
+          if (!existing.success) throw new Error(existing.error);
+          const row = existing.data?.rows[0];
+          if (row && observationHash(this.rowToEntity(row)) === previous.version) await this.deleteEntity(previous.name);
+          else if (row) vault.syncEntity(this.rowToEntity(row), await this.getRelationsForEntity(previous.name));
+          this.vaultNotes.delete(fname);
         }
       }
-      // detect new/modified
-      for (const fname of files) {
-        let mtime = 0;
-        try { mtime = fs.statSync(joinPath(vaultPath, fname)).mtimeMs; } catch { continue; }
-        const prev = this.vaultMtimes.get(fname);
-        if (prev === undefined || prev !== mtime) {
-          this.vaultMtimes.set(fname, mtime);
-          await this.syncVaultNoteToSqlite(fname);
+      for (const [fname, content] of snapshot) {
+        const hash = createHash('sha256').update(content).digest('hex');
+        if (this.vaultNotes.get(fname)?.hash !== hash) {
+          await this.syncVaultNoteToSqlite(fname, content);
         }
       }
-    } catch (e) { void e; }
+      for (const [filename, content] of snapshot) {
+        const relation = vault.parseRelation(content);
+        if (!relation) continue;
+        const insert = await this.sqliteManager.executeSql(this.memoryDbName,
+          `INSERT OR IGNORE INTO relations(from_entity, to_entity, relation_type, created_at)
+           SELECT ?, ?, ?, ? WHERE EXISTS(SELECT 1 FROM entities WHERE name=?)
+           AND EXISTS(SELECT 1 FROM entities WHERE name=?)`,
+          [relation.from, relation.to, relation.relationType, relation.createdAt, relation.from, relation.to]);
+        if (!insert.success) throw new Error(insert.error);
+        this.vaultRelations.set(filename, relation);
+      }
   }
 
   private startVaultWatcher(): void {
     // initial sync
-    this.syncVaultToSqlite().catch(() => {});
+    this.syncVaultToSqlite().catch(error => console.error('[obsidian] import failed:', error.message));
     this.vaultWatcher = setInterval(() => {
-      this.syncVaultToSqlite().catch(() => {});
+      this.syncVaultToSqlite().catch(error => console.error('[obsidian] import failed:', error.message));
     }, 2000);
     // don't keep process alive solely for watcher
     if (this.vaultWatcher.unref) this.vaultWatcher.unref();
   }
 
-  /** One-time backfill: mirror all existing entities/relations to the vault. */
-  /** Rebuild SQLite from vault (vault is source of truth). Upserts all vault notes. */
+  /** Import entity notes without clearing SQLite or inferring deletions on startup. */
   async rebuildFromVault(): Promise<void> {
-    if (!this.obsidianMirror.isEnabled()) return;
-    if (!this.projectSchemaReady) await this.ensureProjectSchema();
-    const vault = this.obsidianMirror;
-    const vaultPath = vault.getVaultPath();
-    if (!vaultPath) return;
-    try {
-      for (const fname of vault.listNotes()) {
-        const content = vault.readNote(fname);
-        if (!content) continue;
-        const parsed = vault.parseNote(content);
-        if (!parsed) continue;
-        const { name, entityType, observations } = parsed;
-        const existing = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name });
-        const now = new Date().toISOString();
-        if (existing.success && existing.data && existing.data.rows.length > 0) {
-          await this.sqliteManager.updateData(this.memoryDbName, 'entities', { name }, {
-            entity_type: entityType,
-            observations: JSON.stringify(observations),
-            updated_at: now,
-          });
-        } else {
-          try {
-            await this.sqliteManager.insertData(this.memoryDbName, 'entities', [{
-              name,
-              entity_type: entityType,
-              observations: JSON.stringify(observations),
-              created_at: now,
-              updated_at: now,
-            }]);
-          } catch (e) { void e; }
-        }
-      }
-      console.error('[obsidian] rebuild from vault done');
-    } catch (e) { void e; }
+    await this.syncVaultToSqlite();
   }
 
   async backfillVault(): Promise<void> {
@@ -939,7 +1024,7 @@ export class MemoryManager {
       }
       for (const r of relations) this.obsidianMirror.syncRelation(r);
       await this.obsidianMirror.flushSync();
-    } catch (e) { void e; }
+    } catch (e) { throw new Error(`Vault backfill failed: ${(e as Error).message}`); }
   }
 
   // Obsidian vault control (exposed to MCP tools)
@@ -954,8 +1039,10 @@ export class MemoryManager {
   }
 
   async obsidianSync(): Promise<{ synced: boolean; noteCount: number }> {
+    if (!this.obsidianMirror.isEnabled()) return { synced: false, noteCount: 0 };
+    await this.obsidianMirror.pullSync();
     await this.syncVaultToSqlite();
-    this.obsidianMirror.flushSync();
+    await this.obsidianMirror.flushSync();
     const noteCount = this.obsidianMirror.isEnabled() ? this.obsidianMirror.listNotes().length : 0;
     return { synced: true, noteCount };
   }
@@ -1010,7 +1097,7 @@ export class MemoryManager {
     const entity = result.data.rows[0];
     const sanitizedContents = contents.map(c => sanitizePrivateContent(c));
     const currentObservations = this.safeParseObservations(entity.observations);
-    const updatedObservations = [...currentObservations, ...sanitizedContents];
+    const updatedObservations = uniqueObservations([...currentObservations, ...sanitizedContents]);
     const now = new Date().toISOString();
 
     await this.sqliteManager.updateData(
@@ -1169,11 +1256,17 @@ export class MemoryManager {
   }
 
   async deleteRelation(from: string, to: string, relationType: string): Promise<void> {
-    await this.sqliteManager.deleteData(this.memoryDbName, 'relations', {
+    const deletion = await this.sqliteManager.deleteData(this.memoryDbName, 'relations', {
       from_entity: from,
       to_entity: to,
       relation_type: relationType
     });
+    if (!deletion.success) throw new Error(deletion.error);
+    this.obsidianMirror.removeRelation(from, to, relationType);
+    for (const name of new Set([from, to])) {
+      const entity = await this.openNode(name);
+      if (entity) this.obsidianMirror.syncEntity(entity, await this.getRelationsForEntity(name));
+    }
   }
 
   async deleteRelations(relations: Array<{ from: string; to: string; relationType: string }>): Promise<void> {
@@ -1215,7 +1308,8 @@ export class MemoryManager {
         if (!relations.has(key)) relations.set(key, relation);
       }
     }
-    return { entities: [...entities.values()], relations: [...relations.values()] };
+    const edges = [...relations.values()];
+    return { entities: [...entities.values()].map(entity => ({ ...entity, observations: this.cleanObservations(entity, edges) })), relations: edges };
   }
 
   async readStore(database: string, opts?: { limit?: number; offset?: number }): Promise<KnowledgeGraph> {
@@ -1223,14 +1317,12 @@ export class MemoryManager {
     const offset = opts?.offset;
     const entitiesResult = await this.sqliteManager.queryData(database, 'entities', {}, limit, offset, 'updated_at', 'DESC');
     const relationsResult = await this.sqliteManager.queryData(database, 'relations', {}, limit, offset);
-    return {
-      entities: (entitiesResult.success && entitiesResult.data)
-        ? entitiesResult.data.rows.map((row: any) => this.rowToEntity(row))
-        : [],
-      relations: (relationsResult.success && relationsResult.data)
+    const relations: Relation[] = (relationsResult.success && relationsResult.data)
         ? relationsResult.data.rows.map((row: any) => this.rowToRelation(row))
-        : []
-    };
+        : [];
+    const entities: Entity[] = (entitiesResult.success && entitiesResult.data)
+      ? entitiesResult.data.rows.map((row: any) => this.rowToEntity(row)) : [];
+    return { entities: entities.map(entity => ({ ...entity, observations: this.cleanObservations(entity, relations) })), relations };
   }
 
   async readGraph(opts?: { limit?: number; offset?: number }): Promise<KnowledgeGraph> {
@@ -1687,6 +1779,16 @@ export class MemoryManager {
   }
 
   async updateMission(input: UpdateMissionInput, dbSelector: 'project' | 'central' = 'project'): Promise<Mission> {
+    const isClaim = input.claimedBy !== undefined;
+    if (isClaim && (typeof input.claimedBy !== 'string' || !input.claimedBy.trim() || input.claimedBy.trim().length > 100)) {
+      throw new Error('Failed to update mission: claimedBy must be a non-empty string of at most 100 characters');
+    }
+    if (input.status === 'claimed' && !isClaim) {
+      throw new Error('Failed to update mission: claimed status requires claimedBy');
+    }
+    if (isClaim && input.status !== undefined && input.status !== 'claimed' && input.status !== 'in_progress') {
+      throw new Error('Failed to update mission: claims require claimed or in_progress status');
+    }
     const dbTarget = dbSelector === 'central' ? this.centralDbPath : this.memoryDbName;
     await this.ensureMissionsSchema(dbTarget);
 
@@ -1705,7 +1807,7 @@ export class MemoryManager {
 
     if (input.claimedBy !== undefined) {
       updates.push('claimed_by = ?');
-      params.push(input.claimedBy);
+      params.push(input.claimedBy.trim());
       updates.push('claimed_at = ?');
       params.push(now);
       if (!input.status) {
@@ -1728,7 +1830,7 @@ export class MemoryManager {
 
     const updateRes = await this.sqliteManager.executeSql(
       dbTarget,
-      `UPDATE missions SET ${updates.join(', ')} WHERE id = ?`,
+      `UPDATE missions SET ${updates.join(', ')} WHERE id = ?${isClaim ? " AND status = 'queued' AND claimed_by IS NULL AND claimed_at IS NULL" : ''}`,
       params
     );
 
@@ -1739,6 +1841,9 @@ export class MemoryManager {
     const rows = await this.sqliteManager.executeSql(dbTarget, `SELECT * FROM missions WHERE id = ?`, [input.id]);
     if (!rows.success || !rows.data || rows.data.rows.length === 0) {
       throw new Error(`Mission not found: ${input.id}`);
+    }
+    if (isClaim && updateRes.data?.changes !== 1) {
+      throw new Error(`Failed to update mission: mission is not available for claiming: ${input.id}`);
     }
 
     return this.mapMissionRow(rows.data.rows[0]);
