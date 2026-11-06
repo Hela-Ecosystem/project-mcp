@@ -1,9 +1,13 @@
 # Project Guardian MCP
 
+<!-- hela:version:start -->
+**MCP server:** `hela-genome` · **Version:** `3.0.0` · **Canonical tools:** 29. [Current tool reference](docs/TOOLS.md).
+<!-- hela:version:end -->
+
 
 > **Part of the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem)** — This server is **HeLa Genome (`hela-genome`)** — the *State & Memory* component of the HeLa cellular architecture. See the [ecosystem docs](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem) for profiles, workflows, and multi-client setup.
 
-A Model Context Protocol (MCP) server for persistent project memory, knowledge-graph operations, SQLite data access, runtime security checks, and guided project-management workflows. The current registry exposes 38 tools, 11 resources, and 27 prompts.
+A Model Context Protocol (MCP) server for persistent project memory, knowledge-graph operations, SQLite data access, runtime security checks, and guided project-management workflows. The current registry exposes 29 canonical tools, 11 resources, and 27 prompts.
 
 ![Blotcat — guardian on duty, wiring the knowledge graph from memory.db](assets/blotcat-hero.jpg)
 
@@ -20,10 +24,9 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - [Installation](#installation)
 - [Available Tools](#available-tools)
   - [Database Operations (7 tools)](#database-operations-7-tools)
-  - [Memory and Guidance Tools (15 tools)](#memory-and-guidance-tools-15-tools)
+  - [Memory and Guidance Tools](#memory-and-guidance-tools)
   - [Fleet Mission Ledger Tools (3 tools)](#fleet-mission-ledger-tools-3-tools)
-  - [Runtime Companion Tools (12 tools)](#runtime-companion-tools-12-tools)
-  - [UI Tools (4 tools)](#ui-tools-4-tools)
+  - [Runtime Companion Tools](#runtime-companion-tools)
 - [AI Guidance System](#ai-guidance-system)
   - [Available Resources](#available-resources)
   - [Available Prompts](#available-prompts)
@@ -85,12 +88,12 @@ The repository includes six `guardian-*` AgentSkills and exposes their operation
 
 | Companion | Runtime role | MCP surface |
 | --- | --- | --- |
-| `guardian-memory` | Persistent entities, relations, and observations | Twelve memory tools |
+| `guardian-memory` | Persistent entities, relations, and observations | `memory_edit`, graph/search/context tools |
 | `guardian-session` | Active-task, bug, blocker, and recent-change summaries | `get_session_context` |
 | `guardian-tracker` | Bounded Git diff and untracked-file analysis | `analyze_git_changes` |
 | `guardian-wall` | Untrusted-text normalization and prompt-injection detection | `inspect_untrusted_text` |
-| `guardian-security` | Secret scanning and Trivy image scanning | `scan_project_secrets`, `scan_container_image` |
-| `guardian-cache` | Optional namespaced Redis storage | Four `cache_*` tools |
+| `guardian-security` | Secret scanning and Trivy image scanning | `security_scan` (`secrets` / `container`) |
+| `guardian-cache` | Optional namespaced Redis storage | `cache` (`get` / `set` / `delete` / `scan`) |
 
 AgentSkills provide host-side workflows and instructions. The MCP runtime implements the corresponding operations directly in TypeScript, except container scanning, which invokes Trivy as a bounded external process. No generic script or shell execution tool is exposed.
 
@@ -106,24 +109,24 @@ AgentSkills provide host-side workflows and instructions. The MCP runtime implem
 ### Advanced Features
 - **Schema Validation**: Comprehensive input validation with Zod schemas
 - **Error Handling**: Detailed error messages and graceful failure handling
-- **Connection Management**: Bounded 20-connection LRU cache with `WAL` + `synchronous=NORMAL` + `cache_size=-64000` + `journal_size_limit=67108864` + `temp_store=MEMORY` + `busy_timeout=5000`, monthly `VACUUM` (`POST /api/vacuum`) and shutdown cleanup
+- **Connection Management**: Bounded 20-connection LRU cache with `WAL` + `synchronous=NORMAL` + `cache_size=-64000` + `journal_size_limit=67108864` + `temp_store=MEMORY` + `busy_timeout=5000`, maintenance and shutdown cleanup. The removed web UI's REST routes are not a supported interface.
 - **File Integration**: CSV and SQL imports are streamed; CSV writes use bounded string assembly
-- **Result Limits & Pagination**: Unbounded raw `SELECT` capped at 10,000 rows; `read_graph`/`readStore` default `5000` with `?limit=&offset=`, `read_graph_stream` cursor `500/page` via `GET /api/graph/stream?cursor=&limit=&` + `POST /api/vacuum`, `search_nodes` capped 100 (hybrid RRF `k=60`)
+- **Result Limits & Pagination**: Raw `SELECT` results are bounded; use the MCP `read_graph`, `read_graph_stream`, and `search_nodes` schemas for supported pagination and search limits, rather than removed UI HTTP routes.
 
 ### Enterprise Features
 - **TypeScript**: Fully typed with comprehensive error handling
 - **Input Validation**: Zod schema validation for all parameters
 - **Error Recovery**: Graceful error handling with detailed error messages
 - **Resource Management**: Automatic cleanup of connections and resources
-- **Testing**: Fourteen Jest suites with 153 passing tests (`WAL` + pagination + `close_ui` + `read_graph_stream` + `e2e-vector hybrid`)
+- **Testing**: The current isolated regression run passes 19 suites / 242 tests, including vault conflicts, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service.
 
 ## Requirements
 
-- **Node.js**: >= 18.0.0
+- **Node.js**: Node 22 LTS is the validated ecosystem environment; see `package.json` for the package's declared standalone engine range.
 - **npm**: Latest stable version
 - **SQLite3**: Automatically installed as dependency
-- **Redis**: Optional; required only for `cache_*` tools through `REDIS_URL`
-- **Trivy**: Optional; required only for `scan_container_image`
+- **Redis**: Optional; required only for `cache` actions through `REDIS_URL`
+- **Trivy**: Optional; required only for `security_scan` with `action: "container"`
 
 ## Installation
 
@@ -174,7 +177,7 @@ When you pull new updates or modify the code, you must rebuild the server and re
 
 ![Blotcat opening a large toolbox with three labeled drawers, holding a wrench](assets/blotcat-tool-categories.jpg)
 
-This MCP server currently provides **38 tools**:
+This MCP server currently advertises **29 canonical tools**. The generated [tool reference](docs/TOOLS.md) lists their names and consolidated actions.
 
 > **Tool reference note:** sections below preserve legacy entry points for compatibility. The canonical surface is 29 tools (added `obsidian_vault` and 3 fleet mission tools `create_mission`, `list_missions`, `update_mission`; removed `ui_server` in favor of the Obsidian vault mirror). Legacy names such as `create_entity` and `cache_get` normalize to canonical actions and emit a deprecation warning. Section counts include those aliases.
 
@@ -248,7 +251,9 @@ Export memory table data to CSV or JSON file.
 - `options` (optional): Export options (delimiter, includeHeader)
 - `database` (optional): `"project"` or `"central"`, default `"project"`
 
-### Memory and Guidance Tools (15 tools)
+### Memory and Guidance Tools
+
+Use `memory_edit` for entity/relation/observation mutations and `harness_sessions` with `action: "list"` or `"sync"` for harness ingestion. Older entry points documented below are compatibility aliases, not additional advertised tools.
 
 #### `initialize_memory` - Initialize Memory System
 Set up the project memory database schema and tables.
@@ -407,7 +412,9 @@ Claim a queued, unowned mission or report its lifecycle progress (e.g. marking `
 - `error` (optional): Error message if mission failed
 - `database` (optional, default: `project`): `project` | `central`
 
-### Runtime Companion Tools (12 tools)
+### Runtime Companion Tools
+
+The canonical wrappers are `security_scan` and `cache`. The `scan_*` and `cache_*` entry points below are legacy aliases; use the action-based wrappers in new integrations.
 
 #### `sync_central_memory`
 Merge the active project knowledge graph into the central memory database (`~/memory/memory.db` by default, override with `GUARDIAN_CENTRAL_DB`). Observation unions preserve independent facts and their existing order; entity type follows the newer timestamp, and relations are unique by endpoints/type. Central imports use the same additive merge instead of overwriting local observations. Every memory write also syncs automatically; call this tool to force a sync on demand. The first sync of each day also snapshots the central database and prunes old backups beyond the newest seven. Central memory remains an aggregate, not a deletion-propagating replica or a mission ledger synchronizer.
@@ -995,7 +1002,7 @@ project-mcp/
 
 - **server.ts**: MCP server lifecycle, transport, handlers, and shutdown coordination
 - **handlers/request-handlers.ts**: Central dispatcher routing tool calls to appropriate managers
-- **tools/**: Tool definition and registration system (38 tools total)
+- **tools/**: Tool definition and registration system (29 canonical tools; legacy action aliases are not additional advertised tools)
   - `tool-registry.ts`: Lists all available tools (7 DB + 12 memory + 1 guidance + 12 runtime + 2 session bridge + 4 UI/stream)
   - `database-tools.ts`: Database operation schemas (7 tools)
   - `memory-tools.ts`: Memory management schemas (12 tools)

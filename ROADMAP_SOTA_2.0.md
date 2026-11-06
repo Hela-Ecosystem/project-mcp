@@ -1,5 +1,7 @@
 # Project Guardian SOTA Roadmap — 1.1.0 → 2.0.0
 
+**Historical roadmap, not the current version/API reference.** The package now uses the 3.0.0 metadata baseline; retained beta versions and old UI routes below describe the original work. See [README](README.md) and [canonical tools](docs/TOOLS.md) for the supported surface.
+
 > Documented 2026-08-26 as TODO. Updated 2026-08-27: **Provider A chosen** + **POC done** `b4d4b1d`/`673a238` + **merged to master** `f7876bf` as **2.0.0-beta-1** `6948910` + **Phase 2 done** `fa033ec`/`c2dd6ca`/`e43ca01` as **2.0.0-beta-2** `6fa5d90` (`v2.0.0-beta-2` tag, branches pruned).
 
 ## Goal
