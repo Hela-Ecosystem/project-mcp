@@ -6,6 +6,7 @@ import { PromptHandlers } from '../src/prompts/prompt-handlers';
 import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { z } from 'zod';
 
 describe('Fleet Mission Ledger Tools', () => {
   let sqliteManager: SQLiteManager;
@@ -131,16 +132,13 @@ describe('Fleet Mission Ledger Tools', () => {
         payload: { task: 'verify-fleet' },
       });
 
-      expect(createRes.success).toBe(true);
-      expect(createRes.data.title).toBe('Global orchestrator test');
+      expect(createRes).toMatchObject({ success: true, data: { title: 'Global orchestrator test' } });
 
       const listRes = await requestHandlers.handleToolCall('list_missions', {
         targetAgent: 'worker-1',
       });
 
-      expect(listRes.success).toBe(true);
-      expect(listRes.data.length).toBe(1);
-      expect(listRes.data[0].priority).toBe('urgent');
+      expect(listRes).toMatchObject({ success: true, data: [expect.objectContaining({ priority: 'urgent' })] });
     });
 
     test('update_mission via handleToolCall', async () => {
@@ -149,14 +147,12 @@ describe('Fleet Mission Ledger Tools', () => {
       });
 
       const updateRes = await requestHandlers.handleToolCall('update_mission', {
-        id: createRes.data.id,
+        id: z.object({ data: z.object({ id: z.string() }) }).parse(createRes).data.id,
         status: 'in_progress',
         claimedBy: 'agent-alpha',
       });
 
-      expect(updateRes.success).toBe(true);
-      expect(updateRes.data.status).toBe('in_progress');
-      expect(updateRes.data.claimedBy).toBe('agent-alpha');
+      expect(updateRes).toMatchObject({ success: true, data: { status: 'in_progress', claimedBy: 'agent-alpha' } });
     });
 
     test.each([
@@ -175,7 +171,7 @@ describe('Fleet Mission Ledger Tools', () => {
     test('returns a tool error when a mission is already claimed', async () => {
       const mission = await memoryManager.createMission({ title: 'Exclusive tool claim' });
       const first = await requestHandlers.handleToolCall('update_mission', { id: mission.id, claimedBy: 'first' });
-      expect(first.success).toBe(true);
+      expect(first).toHaveProperty('success', true);
       await expect(requestHandlers.handleToolCall('update_mission', { id: mission.id, claimedBy: 'second' })).rejects.toThrow('not available for claiming');
       expect((await memoryManager.listMissions({ id: mission.id }))[0].claimedBy).toBe('first');
     });
@@ -186,11 +182,10 @@ describe('Fleet Mission Ledger Tools', () => {
           { name: 'CoreService', entityType: 'service', observations: ['Runs HTTP gateway'] }
         ]
       });
-      expect(createEntityRes.success).toBe(true);
+      expect(createEntityRes).toHaveProperty('success', true);
 
       const graphRes = await requestHandlers.handleToolCall('read_graph', {});
-      expect(graphRes.success).toBe(true);
-      expect(graphRes.data.entities.some((e: any) => e.name === 'CoreService')).toBe(true);
+      expect(graphRes).toMatchObject({ success: true, data: { entities: expect.arrayContaining([expect.objectContaining({ name: 'CoreService' })]) } });
     });
   });
 });

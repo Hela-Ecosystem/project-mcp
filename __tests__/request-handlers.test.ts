@@ -91,7 +91,7 @@ describe('RequestHandlers', () => {
 
       expect(result).toHaveProperty('success', true);
       expect(result).toHaveProperty('data');
-      expect(result.data).toHaveProperty('rows');
+      expect(result).toHaveProperty('data.rows');
     });
 
     test('should handle query_data tool', async () => {
@@ -232,7 +232,7 @@ describe('RequestHandlers', () => {
       });
 
       expect(result).toHaveProperty('success', true);
-      expect(result.message).toContain('Created 1 entities');
+      expect(result).toHaveProperty('message', 'Created 1 entities');
     });
 
     test('should handle read_graph tool', async () => {
@@ -247,9 +247,9 @@ describe('RequestHandlers', () => {
       });
 
       expect(result).toHaveProperty('success', true);
-      expect(result.data).toHaveProperty('entities');
-      expect(result.data).toHaveProperty('relations');
-      expect(result.data).toHaveProperty('nextCursor');
+      expect(result).toHaveProperty('data.entities');
+      expect(result).toHaveProperty('data.relations');
+      expect(result).toHaveProperty('data.nextCursor');
     });
 
     test('should search unicode entity names', async () => {
@@ -266,15 +266,14 @@ describe('RequestHandlers', () => {
         query: '测试'
       });
 
-      expect(result.success).toBe(true);
-      expect(result.data.entities.some((entity: { name: string }) => entity.name === 'task:测试')).toBe(true);
+      expect(result).toMatchObject({ success: true, data: { entities: expect.arrayContaining([expect.objectContaining({ name: 'task:测试' })]) } });
     });
 
     test('should reinitialize schema after set_project_root', async () => {
       const targetRoot = mkdtempSync(join(tmpdir(), 'guardian-root-'));
       try {
         const switched = await requestHandlers.handleToolCall('set_project_root', { path: targetRoot });
-        expect(switched.success).toBe(true);
+        expect(switched).toHaveProperty('success', true);
 
         const created = await requestHandlers.handleToolCall('memory_edit', {
           action: 'create_entities',
@@ -284,19 +283,17 @@ describe('RequestHandlers', () => {
             observations: ['isolated root']
           }]
         });
-        expect(created.success).toBe(true);
-        expect(created.data).toHaveLength(1);
+        expect(created).toMatchObject({ success: true, data: [expect.objectContaining({ name: 'root2:Only' })] });
 
         const graph = await requestHandlers.handleToolCall('read_graph', { database: 'project' });
-        expect(graph.success).toBe(true);
-        expect(graph.data.entities.some((entity: { name: string }) => entity.name === 'root2:Only')).toBe(true);
+        expect(graph).toMatchObject({ success: true, data: { entities: expect.arrayContaining([expect.objectContaining({ name: 'root2:Only' })]) } });
 
         const exported = await requestHandlers.handleToolCall('export_data', {
           table: 'entities',
           filePath: 'export.json',
           format: 'json'
         });
-        expect(exported.success).toBe(true);
+        expect(exported).toHaveProperty('success', true);
         expect(existsSync(join(targetRoot, 'export.json'))).toBe(true);
 
         const outside = await requestHandlers.handleToolCall('export_data', {
@@ -304,7 +301,7 @@ describe('RequestHandlers', () => {
           filePath: '/tmp/guardian-outside.json',
           format: 'json'
         });
-        expect(outside.success).toBe(false);
+        expect(outside).toHaveProperty('success', false);
       } finally {
         rmSync(targetRoot, { recursive: true, force: true });
       }
@@ -320,6 +317,15 @@ describe('RequestHandlers', () => {
   });
 
   describe('Error Handling', () => {
+    test.each([null, [], 'not an object', 1])('rejects non-object tool arguments: %p', async input => {
+      await expect(requestHandlers.handleToolCall('read_graph', input)).rejects.toThrow('Tool execution failed:');
+    });
+
+    test('validates prompt arguments as strings and vault actions before dispatch', async () => {
+      await expect(requestHandlers.handleToolCall('get_project_guidance', { guidance_name: 'project_setup', arguments: { project_name: 42 } })).rejects.toThrow('Tool execution failed:');
+      await expect(requestHandlers.handleToolCall('obsidian_vault', { action: 'overwrite' })).rejects.toThrow('Tool execution failed:');
+    });
+
     test('should handle non-existent tool', async () => {
       await expect(requestHandlers.handleToolCall('non_existent_tool', {}))
         .rejects.toThrow('Unknown tool: non_existent_tool');

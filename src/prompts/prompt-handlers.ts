@@ -1,5 +1,5 @@
 export class PromptHandlers {
-  async handleGetPrompt(name: string, args: Record<string, any>): Promise<string> {
+  async handleGetPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     try {
       // Project management prompts
       if (['project-setup', 'sprint-planning', 'progress-update', 'retrospective'].includes(name)) {
@@ -32,7 +32,7 @@ export class PromptHandlers {
     }
   }
 
-  private async handleProjectManagementPrompt(name: string, args: Record<string, any>): Promise<string> {
+  private async handleProjectManagementPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     switch (name) {
       case 'project-setup':
         return this.generateProjectSetupPrompt(args);
@@ -47,7 +47,7 @@ export class PromptHandlers {
     }
   }
 
-  private async handleQualityPrompt(name: string, args: Record<string, any>): Promise<string> {
+  private async handleQualityPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     switch (name) {
       case 'code-review':
         return this.generateCodeReviewPrompt(args);
@@ -60,7 +60,7 @@ export class PromptHandlers {
     }
   }
 
-  private async handleManagementPrompt(name: string, args: Record<string, any>): Promise<string> {
+  private async handleManagementPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     switch (name) {
       case 'team-productivity':
         return this.generateTeamProductivityPrompt(args);
@@ -77,7 +77,7 @@ export class PromptHandlers {
     }
   }
 
-  private async handlePlanningPrompt(name: string, args: Record<string, any>): Promise<string> {
+  private async handlePlanningPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     switch (name) {
       case 'requirements-gathering':
         return this.generateRequirementsGatheringPrompt(args);
@@ -94,7 +94,7 @@ export class PromptHandlers {
     }
   }
 
-  private async handleAdvancedPrompt(name: string, args: Record<string, any>): Promise<string> {
+  private async handleAdvancedPrompt(name: string, args: Record<string, string | undefined>): Promise<string> {
     switch (name) {
       case 'ci-cd-setup':
         return this.generateCICDSetupPrompt(args);
@@ -121,7 +121,7 @@ export class PromptHandlers {
     }
   }
 
-  private generateProjectSetupPrompt(args: Record<string, any>): string {
+  private generateProjectSetupPrompt(args: Record<string, string | undefined>): string {
     const projectName = args.project_name || 'New Project';
     const teamMembers = args.team_members ? args.team_members.split(',').map((m: string) => m.trim()) : [];
 
@@ -162,7 +162,7 @@ ${teamMembers.length > 0 ? `Create relationships between team members and the pr
 Remember to use \`read_graph\` regularly to view your project structure!`;
   }
 
-  private generateSprintPlanningPrompt(args: Record<string, any>): string {
+  private generateSprintPlanningPrompt(args: Record<string, string | undefined>): string {
     const sprintName = args.sprint_name || 'Sprint';
     const duration = args.duration_days || 14;
 
@@ -211,7 +211,7 @@ Use \`memory_edit\` with action \`create_relations\` to establish task dependenc
 Track everything in Project Guardian for visibility and accountability!`;
   }
 
-  private generateProgressUpdatePrompt(args: Record<string, any>): string {
+  private generateProgressUpdatePrompt(args: Record<string, string | undefined>): string {
     const taskName = args.task_name || 'task';
     const progressNotes = args.progress_notes || 'Progress update';
 
@@ -252,7 +252,7 @@ Use \`read_graph\` to see broader project impact.
 Track progress consistently for accurate project visibility!`;
   }
 
-  private generateRetrospectivePrompt(args: Record<string, any>): string {
+  private generateRetrospectivePrompt(args: Record<string, string | undefined>): string {
     const timePeriod = args.time_period || 'recent period';
 
     return `# Retrospective Guide for ${timePeriod}
@@ -302,7 +302,7 @@ Assign owners and timelines for improvements.
 Use retrospectives to continuously improve processes!`;
   }
 
-  private generateCodeReviewPrompt(args: Record<string, any>): string {
+  private generateCodeReviewPrompt(args: Record<string, string | undefined>): string {
     const prTitle = args.pull_request_title || 'Code Changes';
     const reviewer = args.reviewer_name || 'Reviewer';
 
@@ -347,7 +347,7 @@ Conduct comprehensive code review as ${reviewer}.
 Track all code review activities for audit and improvement!`;
   }
 
-  private generateBugTrackingPrompt(args: Record<string, any>): string {
+  private generateBugTrackingPrompt(args: Record<string, string | undefined>): string {
     const bugDesc = args.bug_description || 'Software Bug';
     const severity = args.severity_level || 'Medium';
 
@@ -392,7 +392,7 @@ Ensure bug is properly resolved.
 Track bugs systematically for quality assurance!`;
   }
 
-  private generateTechnicalDebtPrompt(args: Record<string, any>): string {
+  private generateTechnicalDebtPrompt(args: Record<string, string | undefined>): string {
     const componentName = args.component_name || 'component';
     const assessmentScope = args.assessment_scope || 'system';
 
@@ -425,7 +425,7 @@ Assess technical debt at ${assessmentScope} level.
 Track technical debt to maintain code quality!`;
   }
 
-  private generateTeamProductivityPrompt(args: Record<string, any>): string {
+  private generateTeamProductivityPrompt(args: Record<string, string | undefined>): string {
     const timeframe = args.timeframe || 'month';
     const focusArea = args.focus_area || 'overall';
 
@@ -467,7 +467,7 @@ Analyze team productivity with focus on ${focusArea}.
 Drive productivity improvements through data-driven insights!`;
   }
 
-  private generateResourceAllocationPrompt(args: Record<string, any>): string {
+  private generateResourceAllocationPrompt(args: Record<string, string | undefined>): string {
     const resourceType = args.resource_type || 'human';
     const planningHorizon = args.planning_horizon || 'quarter';
 
@@ -509,7 +509,7 @@ Optimize ${resourceType} resource allocation planning.
 Balance resource utilization for optimal productivity!`;
   }
 
-  private generateStakeholderCommunicationPrompt(args: Record<string, any>): string {
+  private generateStakeholderCommunicationPrompt(args: Record<string, string | undefined>): string {
     const commType = args.communication_type || 'status_update';
     const audience = args.audience || 'team';
 
@@ -552,7 +552,7 @@ Manage stakeholder communication effectively.
 Maintain transparent and effective stakeholder communication!`;
   }
 
-  private generateDocumentationManagementPrompt(args: Record<string, any>): string {
+  private generateDocumentationManagementPrompt(args: Record<string, string | undefined>): string {
     const docType = args.documentation_type || 'api';
     const updateReason = args.update_reason || 'feature addition';
 
@@ -586,7 +586,7 @@ Update ${docType} documentation due to ${updateReason}.
 Maintain up-to-date documentation for user success!`;
   }
 
-  private generateChangeManagementPrompt(args: Record<string, any>): string {
+  private generateChangeManagementPrompt(args: Record<string, string | undefined>): string {
     const changeDesc = args.change_description || 'Project change';
     const impactLevel = args.impact_assessment || 'Medium';
 
@@ -632,7 +632,7 @@ Manage ${impactLevel} impact change systematically.
 Manage changes systematically to minimize disruption!`;
   }
 
-  private generateRequirementsGatheringPrompt(args: Record<string, any>): string {
+  private generateRequirementsGatheringPrompt(args: Record<string, string | undefined>): string {
     const reqType = args.requirement_type || 'functional';
     const stakeholders: string[] = args.stakeholders ? args.stakeholders.split(',').map((s: string) => s.trim()) : [];
     const stakeholdersSection = stakeholders.length > 0
@@ -675,7 +675,7 @@ Gather comprehensive ${reqType} requirements from stakeholders.${stakeholdersSec
 Gather requirements systematically for successful delivery!`;
   }
 
-  private generateUserStoryManagementPrompt(args: Record<string, any>): string {
+  private generateUserStoryManagementPrompt(args: Record<string, string | undefined>): string {
     const featureName = args.feature_name || 'New Feature';
     const userRole = args.user_role || 'user';
 
@@ -714,7 +714,7 @@ Create and manage user stories for ${userRole} needs.
 Create valuable user stories for successful delivery!`;
   }
 
-  private generateTestingStrategyPrompt(args: Record<string, any>): string {
+  private generateTestingStrategyPrompt(args: Record<string, string | undefined>): string {
     const appType = args.application_type || 'web';
     const criticality = args.criticality_level || 'medium';
 
@@ -764,7 +764,7 @@ Develop comprehensive testing strategy for ${criticality} criticality applicatio
 Implement comprehensive testing for quality assurance!`;
   }
 
-  private generateSecurityAssessmentPrompt(args: Record<string, any>): string {
+  private generateSecurityAssessmentPrompt(args: Record<string, string | undefined>): string {
     const assessmentScope = args.assessment_scope || 'application';
     const complianceReqs = args.compliance_requirements || '';
 
@@ -813,7 +813,7 @@ ${complianceReqs ? `- ${complianceReqs} requirement validation` : '- Industry st
 Maintain security posture through regular assessments!`;
   }
 
-  private generatePerformanceOptimizationPrompt(args: Record<string, any>): string {
+  private generatePerformanceOptimizationPrompt(args: Record<string, string | undefined>): string {
     const performanceMetric = args.performance_metric || 'response_time';
     const optimizationGoal = args.optimization_goal || 'improve by 50%';
 
@@ -854,7 +854,7 @@ Optimize ${performanceMetric} to ${optimizationGoal}.
 Achieve performance goals through systematic optimization!`;
   }
 
-  private generateCICDSetupPrompt(args: Record<string, any>): string {
+  private generateCICDSetupPrompt(args: Record<string, string | undefined>): string {
     const pipelineType = args.pipeline_type || 'full_ci_cd';
     const targetPlatform = args.target_platform || 'aws';
 
@@ -910,7 +910,7 @@ Set up ${pipelineType} pipelines for automated deployment.
 Implement reliable automated deployment pipelines!`;
   }
 
-  private generateArchitectureReviewPrompt(args: Record<string, any>): string {
+  private generateArchitectureReviewPrompt(args: Record<string, string | undefined>): string {
     const architectureType = args.architecture_type || 'microservices';
     const reviewFocus = args.review_focus || 'scalability';
 
@@ -956,7 +956,7 @@ Conduct architecture review with focus on ${reviewFocus}.
 Ensure architectural decisions support long-term success!`;
   }
 
-  private generateCostManagementPrompt(args: Record<string, any>): string {
+  private generateCostManagementPrompt(args: Record<string, string | undefined>): string {
     const costCategory = args.cost_category || 'infrastructure';
     const budgetConstraint = args.budget_constraint || 'flexible';
 
@@ -1002,7 +1002,7 @@ Manage ${costCategory} costs with ${budgetConstraint} budget constraints.
 Optimize costs while maintaining service quality and performance!`;
   }
 
-  private generateCustomerFeedbackPrompt(args: Record<string, any>): string {
+  private generateCustomerFeedbackPrompt(args: Record<string, string | undefined>): string {
     const feedbackChannel = args.feedback_channel || 'survey';
     const feedbackFocus = args.feedback_focus || 'usability';
 
@@ -1064,7 +1064,7 @@ Collect and analyze customer feedback with focus on ${feedbackFocus}.
 Drive product improvements through customer insights!`;
   }
 
-  private generateInnovationPlanningPrompt(args: Record<string, any>): string {
+  private generateInnovationPlanningPrompt(args: Record<string, string | undefined>): string {
     const innovationType = args.innovation_type || 'product';
     const riskTolerance = args.risk_tolerance || 'moderate';
 
@@ -1112,7 +1112,7 @@ Plan ${innovationType} innovation initiatives with ${riskTolerance} risk toleran
 Foster innovation while managing risk appropriately!`;
   }
 
-  private generateIncidentResponsePrompt(args: Record<string, any>): string {
+  private generateIncidentResponsePrompt(args: Record<string, string | undefined>): string {
     const incidentSeverity = args.incident_severity || 'high';
     const incidentType = args.incident_type || 'availability';
 
@@ -1174,7 +1174,7 @@ Manage ${incidentSeverity} severity ${incidentType} incident systematically.
 Maintain system reliability through effective incident management!`;
   }
 
-  private generateKnowledgeTransferPrompt(args: Record<string, any>): string {
+  private generateKnowledgeTransferPrompt(args: Record<string, string | undefined>): string {
     const knowledgeDomain = args.knowledge_domain || 'technical';
     const transferRecipients = args.transfer_recipients || 'team';
 
@@ -1243,7 +1243,7 @@ Plan and execute comprehensive knowledge transfer sessions.
 Ensure successful knowledge transfer for team continuity!`;
   }
 
-  private generateVendorManagementPrompt(args: Record<string, any>): string {
+  private generateVendorManagementPrompt(args: Record<string, string | undefined>): string {
     const vendorType = args.vendor_type || 'cloud';
     const contractValue = args.contract_value || 'medium';
 
@@ -1300,7 +1300,7 @@ Manage ${vendorType} vendor relationships and performance.
 Optimize vendor relationships for maximum value delivery!`;
   }
 
-  private generateReleasePlanningPrompt(args: Record<string, any>): string {
+  private generateReleasePlanningPrompt(args: Record<string, string | undefined>): string {
     const version = args.release_version || 'next release';
     const releaseDate = args.release_date || 'TBD';
 
@@ -1348,7 +1348,7 @@ Use \`read_graph\` and \`get_session_context\` to review blockers and update the
 Ship only when the quality gates and rollback plan are verified.`;
   }
 
-  private generateRiskAssessmentPrompt(args: Record<string, any>): string {
+  private generateRiskAssessmentPrompt(args: Record<string, string | undefined>): string {
     const description = args.risk_description || 'Unspecified risk';
     const impact = args.impact_level || 'Medium';
 

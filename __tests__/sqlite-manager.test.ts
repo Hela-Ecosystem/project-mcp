@@ -60,8 +60,8 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.listDatabases();
 
       expect(result.success).toBe(true);
-      expect(result.data.length).toBeGreaterThanOrEqual(3); // memory + test_db1 + test_db2
-      const testDbs = result.data.filter((db: any) => db.name.startsWith('test_db'));
+      expect(result.data?.length).toBeGreaterThanOrEqual(3); // memory + test_db1 + test_db2
+      const testDbs = result.data?.filter(db => db.name.startsWith('test_db')) ?? [];
       expect(testDbs).toHaveLength(2);
       expect(testDbs[0]).toHaveProperty('name');
       expect(testDbs[0]).toHaveProperty('type', 'sqlite');
@@ -136,7 +136,7 @@ describe('SQLiteManager', () => {
       expect(result.success).toBe(true);
       expect(result.data).toHaveProperty('name', 'users');
       expect(result.data).toHaveProperty('columns');
-      expect(result.data.columns).toHaveLength(3);
+      expect(result.data?.columns).toHaveLength(3);
     });
 
     test('should drop table', async () => {
@@ -179,7 +179,7 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.insertData('test_db', 'users', records);
       
       expect(result.success).toBe(true);
-      expect(result.data.insertedCount).toBe(2);
+      expect(result.data?.insertedCount).toBe(2);
     });
 
     test('should query data', async () => {
@@ -193,9 +193,9 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.queryData('test_db', 'users');
       
       expect(result.success).toBe(true);
-      expect(result.data.rows).toHaveLength(2);
-      expect(result.data.columns).toContain('id');
-      expect(result.data.columns).toContain('name');
+      expect(result.data?.rows).toHaveLength(2);
+      expect(result.data?.columns).toContain('id');
+      expect(result.data?.columns).toContain('name');
     });
 
     test('should reject unsafe table identifiers', async () => {
@@ -227,8 +227,8 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.queryData('test_db', 'users', { age: 30 });
       
       expect(result.success).toBe(true);
-      expect(result.data.rows).toHaveLength(1);
-      expect(result.data.rows[0].name).toBe('John Doe');
+      expect(result.data?.rows).toHaveLength(1);
+      expect(result.data?.rows[0].name).toBe('John Doe');
     });
 
     test('should update data', async () => {
@@ -246,7 +246,7 @@ describe('SQLiteManager', () => {
       );
       
       expect(result.success).toBe(true);
-      expect(result.data.changes).toBe(1);
+      expect(result.data?.changes).toBe(1);
     });
 
     test('should delete data', async () => {
@@ -260,7 +260,7 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.deleteData('test_db', 'users', { age: 30 });
       
       expect(result.success).toBe(true);
-      expect(result.data.changes).toBe(1);
+      expect(result.data?.changes).toBe(1);
     });
 
     test('should count records', async () => {
@@ -274,7 +274,7 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.countRecords('test_db', 'users');
       
       expect(result.success).toBe(true);
-      expect(result.data.count).toBe(2);
+      expect(result.data?.count).toBe(2);
     });
 
     test('should count records with conditions', async () => {
@@ -288,11 +288,23 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.countRecords('test_db', 'users', { age: 30 });
       
       expect(result.success).toBe(true);
-      expect(result.data.count).toBe(1);
+      expect(result.data?.count).toBe(1);
     });
   });
 
   describe('SQL Execution', () => {
+    test.each([{}, [], Number.NaN, Number.POSITIVE_INFINITY, 1n])('rejects unsupported SQL bindings: %p', async value => {
+      const result = await sqliteManager.executeSql('test_db', 'SELECT ? AS value', [value]);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('SQL parameters must be');
+    });
+
+    test('binds scalar values and buffers without implicit object coercion', async () => {
+      const result = await sqliteManager.executeSql('test_db', 'SELECT ? AS flag, ? AS empty, ? AS bytes', [true, undefined, Buffer.from('ok')]);
+      expect(result.success).toBe(true);
+      expect(result.data?.rows).toEqual([{ flag: 1, empty: null, bytes: Buffer.from('ok') }]);
+    });
+
     beforeEach(async () => {
       await sqliteManager.createDatabase('test_db');
       const schema = {
@@ -307,11 +319,11 @@ describe('SQLiteManager', () => {
     test('should return rows for PRAGMA and CTE queries', async () => {
       const pragmaResult = await sqliteManager.executeSql('test_db', 'PRAGMA integrity_check');
       expect(pragmaResult.success).toBe(true);
-      expect(pragmaResult.data.rows[0].integrity_check).toBe('ok');
+      expect(pragmaResult.data?.rows?.[0].integrity_check).toBe('ok');
 
       const cteResult = await sqliteManager.executeSql('test_db', 'WITH one AS (SELECT 1 AS n) SELECT n FROM one');
       expect(cteResult.success).toBe(true);
-      expect(cteResult.data.rows[0].n).toBe(1);
+      expect(cteResult.data?.rows?.[0].n).toBe(1);
     });
 
     test('should execute SELECT query', async () => {
@@ -325,8 +337,8 @@ describe('SQLiteManager', () => {
       const result = await sqliteManager.executeSql('test_db', 'SELECT * FROM users WHERE id = ?', [1]);
       
       expect(result.success).toBe(true);
-      expect(result.data.rows).toHaveLength(1);
-      expect(result.data.rows[0].name).toBe('John Doe');
+      expect(result.data?.rows).toHaveLength(1);
+      expect(result.data?.rows?.[0].name).toBe('John Doe');
     });
 
     test('should execute INSERT query', async () => {
@@ -337,7 +349,7 @@ describe('SQLiteManager', () => {
       );
       
       expect(result.success).toBe(true);
-      expect(result.data.changes).toBe(1);
+      expect(result.data?.changes).toBe(1);
     });
   });
 

@@ -47,7 +47,7 @@ describe('E2E Vector Hybrid RAG', () => {
     // Verify vec table exists and has rows
     const vecCheck = await sm.executeSql('memory', 'SELECT COUNT(*) as c FROM vec_entities');
     expect(vecCheck.success).toBe(true);
-    expect(vecCheck.data?.rows[0].c).toBe(2);
+    expect(vecCheck.data?.rows?.[0].c).toBe(2);
 
     // Add observation to ui-button and verify vec updates (re-embed)
     await mm.addObservation('task:ui-button', ['Add icon support']);
@@ -58,7 +58,7 @@ describe('E2E Vector Hybrid RAG', () => {
     await mm.deleteEntity('task:ui-button');
     const vecAfterDel = await sm.executeSql('memory', 'SELECT COUNT(*) as c FROM vec_entities');
     expect(vecAfterDel.success).toBe(true);
-    expect(vecAfterDel.data?.rows[0].c).toBe(1);
+    expect(vecAfterDel.data?.rows?.[0].c).toBe(1);
   }, 120000);
 
   test('readStore and readGraph respect limit pagination with vec', async () => {

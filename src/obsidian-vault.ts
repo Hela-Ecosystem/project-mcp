@@ -101,8 +101,7 @@ export class ObsidianVaultMirror {
     if (!this.vaultPath) return [];
     const out: string[] = [];
     const walk = (dir: string, rel: string) => {
-      let entries: string[];
-      entries = fs.readdirSync(dir);
+      const entries = fs.readdirSync(dir);
       for (const e of entries) {
         if (e.startsWith('.')) continue;
         const full = path.join(dir, e);
@@ -155,7 +154,7 @@ export class ObsidianVaultMirror {
       if (section === 'relations' && m) relationBullets.add(m[1].trim());
       if (section !== 'observations') continue;
       if (m) observations.push(m[1].trim());
-      else if (/^  /.test(line) && observations.length) observations[observations.length - 1] += '\n' + line.slice(2);
+        else if (line.startsWith('  ') && observations.length) observations[observations.length - 1] += '\n' + line.slice(2);
     }
     return {
       name, entityType,

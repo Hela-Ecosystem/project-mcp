@@ -13,8 +13,7 @@ import { SQLiteManager } from './sqlite-manager.js';
 import { ImportExportManager } from './import-export.js';
 import { MemoryManager } from './memory-manager.js';
 import { execFileSync } from 'child_process';
-import { join, resolve, isAbsolute } from 'path';
-import { homedir } from 'os';
+import { resolve, isAbsolute } from 'path';
 
 // Modular imports
 import { allTools } from './tools/tool-registry.js';

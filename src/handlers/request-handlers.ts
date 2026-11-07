@@ -7,8 +7,6 @@ import {
   ExecuteSqlSchema, QueryDataSchema, InsertDataSchema, UpdateDataSchema,
   DeleteDataSchema, ImportFromFileSchema, ExportToFileSchema,
   MemoryEditSchema,
-  CreateEntitiesSchema, CreateRelationsSchema, AddObservationsSchema,
-  DeleteEntitiesSchema, DeleteObservationsSchema, DeleteRelationsSchema,
   SearchNodesSchema, OpenNodesSchema, ReadGraphSchema, ReadGraphStreamSchema,
   GetFileContextSchema, GetTimelineSchema,
   CreateMissionSchema, ListMissionsSchema, UpdateMissionSchema
@@ -69,7 +67,7 @@ export function isReadOnlySql(query: string): boolean {
 
 const DatabaseSelector = z.enum(['project', 'central']).default('project');
 
-const toolSchemas: Record<string, z.ZodSchema> = {
+const toolSchemas = {
   read_graph_stream: ReadGraphStreamSchema,
   execute_sql: ExecuteSqlSchema.omit({ database: true }).extend({ database: DatabaseSelector }),
   query_data: QueryDataSchema.omit({ database: true }).extend({ database: DatabaseSelector }),
@@ -98,6 +96,8 @@ const toolSchemas: Record<string, z.ZodSchema> = {
   update_mission: UpdateMissionSchema,
   setup_pre_commit: SetupPreCommitSchema,
   sync_central_memory: SyncCentralMemorySchema,
+  get_project_guidance: z.object({ guidance_name: z.string().min(1), arguments: z.record(z.string(), z.string()).optional() }),
+  obsidian_vault: z.object({ action: z.enum(['status', 'sync', 'rebuild', 'backfill', 'sync_central', 'sync_from_central', 'dedup']).default('status') }),
 };
 
 const runtimeToolNames = new Set([
@@ -115,16 +115,11 @@ export class RequestHandlers {
     private runtimeCapabilities?: RuntimeCapabilities
   ) {}
 
-  async handleToolCall(name: string, args: any): Promise<any> {
+  async handleToolCall(name: string, input: unknown): Promise<unknown> {
     try {
-      const normalized = normalizeToolCall(name, args);
+      const normalized = normalizeToolCall(name, input === undefined ? undefined : z.record(z.string(), z.unknown()).parse(input));
       name = normalized.name;
-      args = normalized.args;
-
-      const schema = toolSchemas[name];
-      if (schema) {
-        args = schema.parse(args);
-      }
+      const args = normalized.args;
 
       if (['execute_sql', 'query_data', 'insert_data', 'update_data', 'delete_data', 'import_data', 'export_data'].includes(name)) {
         return await this.handleDatabaseTool(name, args);
@@ -139,14 +134,15 @@ export class RequestHandlers {
       }
 
       if (name === 'get_project_guidance') {
-        const guidanceContent = await this.promptHandlers.handleGetPrompt(args.guidance_name, args.arguments || {});
+        const guidance = toolSchemas.get_project_guidance.parse(args);
+        const guidanceContent = await this.promptHandlers.handleGetPrompt(guidance.guidance_name, guidance.arguments || {});
         return {
           success: true,
           data: {
-            guidance_name: args.guidance_name,
+            guidance_name: guidance.guidance_name,
             instructions: guidanceContent
           },
-          message: `Successfully loaded guidance for ${args.guidance_name}`
+          message: `Successfully loaded guidance for ${guidance.guidance_name}`
         };
       }
 
@@ -187,9 +183,9 @@ export class RequestHandlers {
     };
   }
 
-  private async handleRuntimeTool(name: string, args: any): Promise<unknown> {
+  private async handleRuntimeTool(name: string, input: unknown): Promise<unknown> {
     switch (name) {
-      case 'set_project_root': return this.setProjectRoot(args);
+      case 'set_project_root': return this.setProjectRoot(toolSchemas.set_project_root.parse(input));
       case 'setup_pre_commit':
         // P0-A7: installs git hooks into the project root — opt-in host mutation.
         if (process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] !== 'true') {
@@ -197,22 +193,27 @@ export class RequestHandlers {
         }
         await this.memoryManager.setupProjectFiles(); return { message: 'Pre-commit configuration installed in the active project root' };
       case 'sync_central_memory': return this.memoryManager.syncToCentral();
-      case 'get_session_context': return this.runtimeCapabilities!.getSessionContext(args);
-      case 'analyze_git_changes': return this.runtimeCapabilities!.analyzeGitChanges(args);
-      case 'inspect_untrusted_text': return this.runtimeCapabilities!.inspectUntrustedText(args);
-      case 'security_scan':
+      case 'get_session_context': return this.runtimeCapabilities!.getSessionContext(toolSchemas.get_session_context.parse(input));
+      case 'analyze_git_changes': return this.runtimeCapabilities!.analyzeGitChanges(toolSchemas.analyze_git_changes.parse(input));
+      case 'inspect_untrusted_text': return this.runtimeCapabilities!.inspectUntrustedText(toolSchemas.inspect_untrusted_text.parse(input));
+      case 'security_scan': {
+        const args = toolSchemas.security_scan.parse(input);
         return args.action === 'secrets'
           ? this.runtimeCapabilities!.scanProjectSecrets(args)
           : this.runtimeCapabilities!.scanContainerImage(args);
-      case 'cache':
+      }
+      case 'cache': {
+        const args = toolSchemas.cache.parse(input);
         switch (args.action) {
           case 'get': return this.runtimeCapabilities!.cacheGet(args);
           case 'set': return this.runtimeCapabilities!.cacheSet(args);
           case 'delete': return this.runtimeCapabilities!.cacheDelete(args);
           case 'scan': return this.runtimeCapabilities!.cacheScan(args);
         }
-        throw new Error(`Unknown cache action: ${args.action}`);
-      case 'obsidian_vault':
+        throw new Error('Unknown cache action');
+      }
+      case 'obsidian_vault': {
+        const args = toolSchemas.obsidian_vault.parse(input);
         switch (args.action) {
           case 'status': return this.memoryManager.obsidianStatus();
           case 'sync': return await this.memoryManager.obsidianSync();
@@ -223,6 +224,7 @@ export class RequestHandlers {
           case 'dedup': return await this.memoryManager.dedupEntities();
         }
         throw new Error(`Unknown obsidian_vault action: ${args.action}`);
+      }
       default: throw new Error(`Unknown runtime tool: ${name}`);
     }
   }
@@ -231,10 +233,11 @@ export class RequestHandlers {
     return selector === 'central' ? this.memoryManager.getCentralDatabaseId() : 'memory';
   }
 
-  private async handleDatabaseTool(name: string, args: any): Promise<any> {
-    const database = this.resolveDatabase(args.database);
+  private async handleDatabaseTool(name: string, input: unknown): Promise<unknown> {
     switch (name) {
       case 'execute_sql': {
+        const args = toolSchemas.execute_sql.parse(input);
+        const database = this.resolveDatabase(args.database);
         // P0-A7: raw SQL reads always allowed; writes need explicit opt-in.
         const head = String(args.query || '').trim().split(/\s+/)[0]?.toUpperCase();
         if (!isReadOnlySql(String(args.query || '')) && process.env['HELA_GENOME_ALLOW_SQL_WRITE'] !== 'true') {
@@ -243,7 +246,9 @@ export class RequestHandlers {
         return await this.sqliteManager.executeSql(database, args.query, args.parameters);
       }
 
-      case 'query_data':
+      case 'query_data': {
+        const args = toolSchemas.query_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         return await this.sqliteManager.queryData(
           database,
           args.table,
@@ -254,20 +259,32 @@ export class RequestHandlers {
           args.orderDirection
         );
 
-      case 'insert_data':
+      }
+      case 'insert_data': {
+        const args = toolSchemas.insert_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         return await this.sqliteManager.insertData(database, args.table, args.records);
 
-      case 'update_data':
+      }
+      case 'update_data': {
+        const args = toolSchemas.update_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         return await this.sqliteManager.updateData(database, args.table, args.conditions, args.updates);
 
-      case 'delete_data':
+      }
+      case 'delete_data': {
+        const args = toolSchemas.delete_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         // P0-A7: bulk delete is destructive — opt-in.
         if (process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] !== 'true') {
           throw new Error('delete_data is disabled (set HELA_GENOME_ALLOW_DESTRUCTIVE=true to enable)');
         }
         return await this.sqliteManager.deleteData(database, args.table, args.conditions);
 
-      case 'import_data':
+      }
+      case 'import_data': {
+        const args = toolSchemas.import_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         return await this.importExportManager.importFromFile(
           database,
           args.table,
@@ -276,7 +293,10 @@ export class RequestHandlers {
           args.options
         );
 
-      case 'export_data':
+      }
+      case 'export_data': {
+        const args = toolSchemas.export_data.parse(input);
+        const database = this.resolveDatabase(args.database);
         return await this.importExportManager.exportToFile(
           database,
           args.table,
@@ -285,16 +305,18 @@ export class RequestHandlers {
           args.conditions,
           args.options
         );
+      }
     }
   }
 
-  private async handleMemoryTool(name: string, args: any): Promise<any> {
+  private async handleMemoryTool(name: string, input: unknown): Promise<unknown> {
     switch (name) {
       case 'initialize_memory':
         await this.memoryManager.initializeMemoryDatabase();
         return { success: true, message: 'Memory system initialized successfully' };
 
       case 'memory_edit': {
+        const args = toolSchemas.memory_edit.parse(input);
         switch (args.action) {
           case 'create_entities': {
             const entities = await this.memoryManager.createEntities(args.entities);
@@ -348,10 +370,11 @@ export class RequestHandlers {
             await this.memoryManager.deleteRelations(args.relations);
             return { success: true, message: `Deleted ${args.relations.length} relations` };
         }
-        throw new Error(`Unknown memory_edit action: ${args.action}`);
+        throw new Error('Unknown memory_edit action');
       }
 
       case 'read_graph': {
+        const args = toolSchemas.read_graph.parse(input);
         const database = args.database;
         if (database) {
           const g = await this.memoryManager.readStore(database === 'central' ? this.memoryManager.getCentralDatabaseId() : 'memory', { limit: args.limit, offset: args.offset });
@@ -362,26 +385,31 @@ export class RequestHandlers {
       }
 
       case 'read_graph_stream': {
+        const args = toolSchemas.read_graph_stream.parse(input);
         const stream = await this.memoryManager.readGraphStream(args.cursor, args.limit);
         return { success: true, data: stream };
       }
 
       case 'search_nodes': {
+        const args = toolSchemas.search_nodes.parse(input);
         const searchResult = await this.memoryManager.searchNodes(args.query, args.limit, args.mode, args.detailLevel);
         return { success: true, data: searchResult };
       }
 
       case 'open_node': {
+        const args = toolSchemas.open_node.parse(input);
         const entitiesDetails = await this.memoryManager.openNodes(args.names);
         return { success: true, data: entitiesDetails };
       }
 
       case 'get_file_context': {
+        const args = toolSchemas.get_file_context.parse(input);
         const fileContext = await this.memoryManager.getFileContext(args.filePath);
         return { success: true, data: fileContext };
       }
 
       case 'get_timeline': {
+        const args = toolSchemas.get_timeline.parse(input);
         const timeline = await this.memoryManager.getTimeline({
           since: args.since,
           entityType: args.entityType,
@@ -391,6 +419,7 @@ export class RequestHandlers {
       }
 
       case 'harness_sessions': {
+        const args = toolSchemas.harness_sessions.parse(input);
         if (args.action === 'list') {
           return { success: true, data: locateStores() };
         }
@@ -415,10 +444,11 @@ export class RequestHandlers {
     }
   }
 
-  private async handleMissionTool(name: string, args: any): Promise<any> {
-    const dbSelector = args.database === 'central' ? 'central' : 'project';
+  private async handleMissionTool(name: string, input: unknown): Promise<unknown> {
     switch (name) {
       case 'create_mission': {
+        const args = toolSchemas.create_mission.parse(input);
+        const dbSelector = args.database === 'central' ? 'central' : 'project';
         const mission = await this.memoryManager.createMission(args, dbSelector);
         return {
           success: true,
@@ -427,6 +457,8 @@ export class RequestHandlers {
         };
       }
       case 'list_missions': {
+        const args = toolSchemas.list_missions.parse(input);
+        const dbSelector = args.database === 'central' ? 'central' : 'project';
         const missions = await this.memoryManager.listMissions(args, dbSelector);
         return {
           success: true,
@@ -435,6 +467,8 @@ export class RequestHandlers {
         };
       }
       case 'update_mission': {
+        const args = toolSchemas.update_mission.parse(input);
+        const dbSelector = args.database === 'central' ? 'central' : 'project';
         const updated = await this.memoryManager.updateMission(args, dbSelector);
         return {
           success: true,

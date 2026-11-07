@@ -13,8 +13,8 @@
     "test:watch": "jest --watch",
     "test:ci": "jest --coverage --maxWorkers=2",
     "clean": "rm -rf dist coverage .tmp",
-    "lint": "eslint src/**/*.ts",
-    "lint:fix": "eslint src/**/*.ts --fix",
+    "lint": "eslint \"src/**/*.ts\" --max-warnings=0",
+    "lint:fix": "eslint \"src/**/*.ts\" --fix --max-warnings=0",
     "prepublishOnly": "npm run clean && npm run build:prod"
   },
   "keywords": [

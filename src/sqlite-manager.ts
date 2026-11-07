@@ -1,7 +1,6 @@
 import sqlite3 from 'sqlite3';
-import { promisify } from 'util';
 import {
-  readFileSync, writeFileSync, existsSync, statSync, mkdirSync, openSync, closeSync,
+  existsSync, statSync, mkdirSync, openSync, closeSync,
   lstatSync, realpathSync, mkdtempSync, rmSync, readSync, chmodSync, linkSync
 } from 'fs';
 import { join, isAbsolute, resolve, dirname, basename } from 'path';
@@ -11,7 +10,7 @@ import {
   ColumnInfo, 
   IndexInfo, 
   QueryResult, 
-  DatabaseOperationResult 
+  DatabaseOperationResult, DatabaseRow, QueryData, SqlExecutionData, TableSchema
 } from './types.js';
 
 interface SQLiteBackup {
@@ -104,7 +103,9 @@ export class SQLiteManager {
       await this.runQuery(db, 'PRAGMA journal_size_limit=67108864');
       await this.runQuery(db, 'PRAGMA temp_store=MEMORY');
       await this.runQuery(db, 'PRAGMA busy_timeout=5000');
-    } catch {}
+    } catch (error) {
+      console.warn('SQLite performance pragmas failed:', error);
+    }
     // Vector extension — best-effort, for vec0 KNN (Jest's import.meta.resolve fails, so use createRequire fallback)
     try {
       const { createRequire } = await import('module');
@@ -114,14 +115,16 @@ export class SQLiteManager {
       const ext = plat === 'win32' ? 'dll' : plat === 'darwin' ? 'dylib' : 'so';
       const pkgName = `sqlite-vec-${plat === 'win32' ? 'windows' : plat}-${arc}`;
       const loadablePath = require.resolve(`${pkgName}/vec0.${ext}`);
-      // @ts-ignore - loadExtension may not be typed
-      (db as any).loadExtension(loadablePath);
-    } catch (e) {
+      await new Promise<void>((resolve, reject) => {
+        db.loadExtension(loadablePath, error => error ? reject(error) : resolve());
+      });
+    } catch {
       // fallback to package's loader (may fail in Jest due to import.meta.resolve)
       try {
-        const vec: any = await import('sqlite-vec');
-        if (vec.load) vec.load(db);
-        else if (vec.default?.load) vec.default.load(db);
+        const vec = await import('sqlite-vec');
+        await new Promise<void>((resolve, reject) => {
+          db.loadExtension(vec.getLoadablePath(), error => error ? reject(error) : resolve());
+        });
       } catch (e2) {
         console.warn('[vec] load failed for', name, (e2 as Error).message);
       }
@@ -129,7 +132,7 @@ export class SQLiteManager {
     return db;
   }
 
-  async createDatabase(name: string): Promise<DatabaseOperationResult> {
+  async createDatabase(name: string): Promise<DatabaseOperationResult<{ name: string; path: string }>> {
     try {
       const startTime = Date.now();
       const dbPath = this.getDatabasePath(name);
@@ -163,7 +166,7 @@ export class SQLiteManager {
     }
   }
 
-  async listDatabases(): Promise<DatabaseOperationResult> {
+  async listDatabases(): Promise<DatabaseOperationResult<DatabaseInfo[]>> {
     try {
       const startTime = Date.now();
       const databases: DatabaseInfo[] = [];
@@ -241,7 +244,7 @@ export class SQLiteManager {
   async createTable(
     database: string, 
     tableName: string, 
-    schema: any
+    schema: TableSchema
   ): Promise<DatabaseOperationResult> {
     try {
       const startTime = Date.now();
@@ -299,18 +302,18 @@ export class SQLiteManager {
     }
   }
 
-  async listTables(database: string): Promise<DatabaseOperationResult> {
+  async listTables(database: string): Promise<DatabaseOperationResult<string[]>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
       
-      const result = await this.query(db, `
+      const result = await this.query<{ name: string }>(db, `
         SELECT name FROM sqlite_master 
         WHERE type='table' AND name NOT LIKE 'sqlite_%'
         ORDER BY name
       `);
       
-      const tables = result.rows.map((row: any) => row.name);
+      const tables = result.rows.map(row => row.name);
       const executionTime = Date.now() - startTime;
       
       return {
@@ -328,39 +331,39 @@ export class SQLiteManager {
     }
   }
 
-  async describeTable(database: string, tableName: string): Promise<DatabaseOperationResult> {
+  async describeTable(database: string, tableName: string): Promise<DatabaseOperationResult<TableInfo>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
       const table = this.assertSafeIdentifier(tableName, 'table name');
       
       // Get table schema
-      const schemaResult = await this.query(db, `PRAGMA table_info(${table})`);
+      const schemaResult = await this.query<{ name: string; type: string; notnull: number; dflt_value: string | null }>(db, `PRAGMA table_info(${table})`);
       
-      const columns: ColumnInfo[] = schemaResult.rows.map((row: any) => ({
+      const columns: ColumnInfo[] = schemaResult.rows.map(row => ({
         name: row.name,
         type: row.type,
         nullable: row.notnull === 0,
-        defaultValue: row.dflt_value,
+        defaultValue: row.dflt_value ?? undefined,
         constraints: []
       }));
       
       // Get indexes
-      const indexesResult = await this.query(db, `PRAGMA index_list(${table})`);
+      const indexesResult = await this.query<{ name: string; unique: number; type?: string }>(db, `PRAGMA index_list(${table})`);
       const indexes: IndexInfo[] = [];
       
       for (const indexRow of indexesResult.rows) {
-        const indexColumnsResult = await this.query(db, `PRAGMA index_info(${indexRow.name})`);
+        const indexColumnsResult = await this.query<{ name: string }>(db, `PRAGMA index_info(${indexRow.name})`);
         indexes.push({
           name: indexRow.name,
-          columns: indexColumnsResult.rows.map((col: any) => col.name),
+          columns: indexColumnsResult.rows.map(col => col.name),
           unique: indexRow.unique === 1,
           type: indexRow.type || 'btree'
         });
       }
       
       // Get row count
-      const countResult = await this.query(db, `SELECT COUNT(*) as count FROM ${table}`);
+      const countResult = await this.query<{ count: number }>(db, `SELECT COUNT(*) as count FROM ${table}`);
       const rowCount = countResult.rows[0].count;
       
       const tableInfo: TableInfo = {
@@ -410,7 +413,7 @@ export class SQLiteManager {
     }
   }
 
-  async insertData(database: string, tableName: string, records: any[]): Promise<DatabaseOperationResult> {
+  async insertData(database: string, tableName: string, records: DatabaseRow[]): Promise<DatabaseOperationResult<{ insertedCount: number }>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -440,7 +443,9 @@ export class SQLiteManager {
         }
         if (useTransaction) await this.runQuery(db, 'COMMIT');
       } catch (e) {
-        if (useTransaction) try { await this.runQuery(db, 'ROLLBACK'); } catch {}
+        if (useTransaction) try { await this.runQuery(db, 'ROLLBACK'); } catch (rollbackError) {
+          console.warn('SQLite rollback failed:', rollbackError);
+        }
         throw e;
       }
       
@@ -463,12 +468,12 @@ export class SQLiteManager {
   async queryData(
     database: string, 
     tableName: string, 
-    conditions?: any, 
+    conditions?: DatabaseRow,
     limit?: number, 
     offset?: number,
     orderBy?: string,
     orderDirection?: string
-  ): Promise<DatabaseOperationResult> {
+  ): Promise<DatabaseOperationResult<QueryData>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -476,7 +481,7 @@ export class SQLiteManager {
       this.assertSafeColumns(conditions, 'condition column');
       
       let sql = `SELECT * FROM ${table}`;
-      const params: any[] = [];
+      const params: unknown[] = [];
       
       if (conditions && Object.keys(conditions).length > 0) {
         const whereClause = Object.keys(conditions).map(key => `${key} = ?`).join(' AND ');
@@ -521,7 +526,7 @@ export class SQLiteManager {
     }
   }
 
-  async updateData(database: string, tableName: string, conditions: any, updates: any): Promise<DatabaseOperationResult> {
+  async updateData(database: string, tableName: string, conditions: DatabaseRow, updates: DatabaseRow): Promise<DatabaseOperationResult<{ changes: number }>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -553,7 +558,7 @@ export class SQLiteManager {
     }
   }
 
-  async deleteData(database: string, tableName: string, conditions: any): Promise<DatabaseOperationResult> {
+  async deleteData(database: string, tableName: string, conditions: DatabaseRow): Promise<DatabaseOperationResult<{ changes: number }>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -582,7 +587,7 @@ export class SQLiteManager {
     }
   }
 
-  async countRecords(database: string, tableName: string, conditions?: any): Promise<DatabaseOperationResult> {
+  async countRecords(database: string, tableName: string, conditions?: DatabaseRow): Promise<DatabaseOperationResult<{ count: number }>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -590,7 +595,7 @@ export class SQLiteManager {
       this.assertSafeColumns(conditions, 'condition column');
       
       let sql = `SELECT COUNT(*) as count FROM ${table}`;
-      const params: any[] = [];
+      const params: unknown[] = [];
       
       if (conditions) {
         const whereClause = Object.keys(conditions).map(key => `${key} = ?`).join(' AND ');
@@ -598,7 +603,7 @@ export class SQLiteManager {
         params.push(...Object.values(conditions));
       }
       
-      const result = await this.query(db, sql, params);
+      const result = await this.query<{ count: number }>(db, sql, params);
       const count = result.rows[0].count;
       const executionTime = Date.now() - startTime;
       
@@ -617,7 +622,7 @@ export class SQLiteManager {
     }
   }
 
-  async executeSql(database: string, query: string, parameters?: any[]): Promise<DatabaseOperationResult> {
+  async executeSql(database: string, query: string, parameters?: unknown[]): Promise<DatabaseOperationResult<SqlExecutionData>> {
     try {
       const startTime = Date.now();
       const db = await this.getConnection(database);
@@ -659,7 +664,7 @@ export class SQLiteManager {
     }
   }
 
-  async backupDatabase(database: string, backupPath: string): Promise<DatabaseOperationResult> {
+  async backupDatabase(database: string, backupPath: string): Promise<DatabaseOperationResult<{ backupPath: string }>> {
     try {
       const startTime = Date.now();
       const dbPath = this.getDatabasePath(database);
@@ -690,7 +695,7 @@ export class SQLiteManager {
     }
   }
 
-  async restoreDatabase(backupPath: string, databaseName: string): Promise<DatabaseOperationResult> {
+  async restoreDatabase(backupPath: string, databaseName: string): Promise<DatabaseOperationResult<{ databaseName: string; path: string }>> {
     try {
       const startTime = Date.now();
       
@@ -822,7 +827,7 @@ export class SQLiteManager {
   }
 
   // Helper methods
-  private async query(db: sqlite3.Database, sql: string, params: any[] = []): Promise<QueryResult> {
+  private async query<Row extends DatabaseRow = DatabaseRow>(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<QueryResult<Row>> {
     const trimmed = sql.trim().toUpperCase();
     if (trimmed.startsWith('SELECT') && !trimmed.includes('LIMIT')) {
       sql += ' LIMIT 10000';
@@ -830,14 +835,14 @@ export class SQLiteManager {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
       
-      db.all(sql, params, (err, rows) => {
+      db.all<Row>(sql, this.bindParameters(params), (err, rows) => {
         if (err) {
           reject(err);
           return;
         }
         
         const executionTime = Date.now() - startTime;
-        const columns = rows.length > 0 ? Object.keys(rows[0] as any) : [];
+        const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
         
         resolve({
           columns,
@@ -849,9 +854,19 @@ export class SQLiteManager {
     });
   }
 
-  private async runQuery(db: sqlite3.Database, sql: string, params: any[] = []): Promise<sqlite3.RunResult> {
+  private bindParameters(params: unknown[]): Array<string | number | Buffer | null> {
+    return params.map(value => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'string' || Buffer.isBuffer(value)) return value;
+      if (typeof value === 'boolean') return Number(value);
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      throw new Error('SQL parameters must be finite numbers, strings, booleans, buffers or null');
+    });
+  }
+
+  private async runQuery(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<sqlite3.RunResult> {
     return new Promise((resolve, reject) => {
-      db.run(sql, params, function(err) {
+      db.run(sql, this.bindParameters(params), function(err) {
         if (err) {
           reject(err);
           return;

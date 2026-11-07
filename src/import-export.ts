@@ -2,7 +2,17 @@ import { readFileSync, writeFileSync, existsSync, createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { SQLiteManager } from './sqlite-manager.js';
 import { PathGuard } from './runtime/path-guard.js';
-import { DatabaseOperationResult } from './types.js';
+import { DatabaseOperationResult, DatabaseRow, ImportOptions, ExportOptions } from './types.js';
+import { z } from 'zod';
+
+interface FileOperationData {
+  importedCount?: number;
+  exportedCount?: number;
+  executedCount?: number;
+  format?: string;
+  filePath?: string;
+  columns?: number;
+}
 
 export class ImportExportManager {
   private pathGuard?: PathGuard;
@@ -34,8 +44,8 @@ export class ImportExportManager {
     table: string,
     filePath: string,
     format: 'csv' | 'json' | 'sql' = 'csv',
-    options?: any
-  ): Promise<DatabaseOperationResult> {
+    options?: ImportOptions
+  ): Promise<DatabaseOperationResult<FileOperationData>> {
     try {
       const startTime = Date.now();
       const resolvedPath = this.resolveReadPath(filePath);
@@ -48,7 +58,7 @@ export class ImportExportManager {
         };
       }
 
-      let records: any[] = [];
+      let records: DatabaseRow[] = [];
       const BATCH_SIZE = 1000;
       let importedCount = 0;
 
@@ -59,7 +69,7 @@ export class ImportExportManager {
           const hasHeader = options?.hasHeader !== false;
           let header: string[] = [];
           let isFirst = true;
-          let batch: any[] = [];
+          let batch: DatabaseRow[] = [];
 
           try {
             for await (const line of rl) {
@@ -75,7 +85,7 @@ export class ImportExportManager {
                 isFirst = false;
               }
 
-              const record: any = {};
+              const record: DatabaseRow = {};
               for (let i = 0; i < header.length; i++) {
                 record[header[i]] = values[i] ?? '';
               }
@@ -146,7 +156,7 @@ export class ImportExportManager {
           executionTime
         };
       } else {
-        return result;
+        return { success: false, message: result.message, error: result.error };
       }
     } catch (error) {
       return {
@@ -162,9 +172,9 @@ export class ImportExportManager {
     table: string,
     filePath: string,
     format: 'csv' | 'json' | 'sql' = 'csv',
-    conditions?: any,
-    options?: any
-  ): Promise<DatabaseOperationResult> {
+    conditions?: DatabaseRow,
+    options?: ExportOptions
+  ): Promise<DatabaseOperationResult<FileOperationData>> {
     try {
       const startTime = Date.now();
       const resolvedPath = this.resolveWritePath(filePath);
@@ -172,8 +182,8 @@ export class ImportExportManager {
       // Query data from database
       const queryResult = await this.sqliteManager.queryData(database, table, conditions);
       
-      if (!queryResult.success) {
-        return queryResult;
+      if (!queryResult.success || !queryResult.data) {
+        return { success: false, message: queryResult.message, error: queryResult.error };
       }
 
       const { columns, rows } = queryResult.data;
@@ -188,7 +198,7 @@ export class ImportExportManager {
           content = this.generateJSON(rows, options);
           break;
         case 'sql':
-          content = this.generateSQL(table, columns, rows, options);
+          content = this.generateSQL(table, columns, rows);
           break;
         default:
           return {
@@ -200,6 +210,7 @@ export class ImportExportManager {
 
       // Write to file
       const encoding = options?.encoding || 'utf8';
+      if (!Buffer.isEncoding(encoding)) throw new Error('Unsupported export encoding');
       writeFileSync(resolvedPath, content, { encoding });
 
       const executionTime = Date.now() - startTime;
@@ -223,7 +234,7 @@ export class ImportExportManager {
     }
   }
 
-  private async parseCSV(filePath: string, options?: any): Promise<any[]> {
+  private async parseCSV(filePath: string, options?: ImportOptions): Promise<DatabaseRow[]> {
     const content = readFileSync(filePath, 'utf8');
     const lines = content.split('\n').filter(line => line.trim());
     
@@ -246,12 +257,12 @@ export class ImportExportManager {
       header = firstLine.map((_, index) => `column_${index + 1}`);
     }
 
-    const records: any[] = [];
+    const records: DatabaseRow[] = [];
     
     for (const line of dataLines) {
       if (line.trim()) {
         const values = this.parseCSVLine(line, delimiter);
-        const record: any = {};
+        const record: DatabaseRow = {};
         
         for (let i = 0; i < header.length; i++) {
           record[header[i]] = values[i] || '';
@@ -286,20 +297,21 @@ export class ImportExportManager {
     return result;
   }
 
-  private async parseJSON(filePath: string): Promise<any[]> {
+  private async parseJSON(filePath: string): Promise<DatabaseRow[]> {
     const content = readFileSync(filePath, 'utf8');
-    const data = JSON.parse(content);
+    const data: unknown = JSON.parse(content);
+    const record = z.record(z.string(), z.unknown());
     
     if (Array.isArray(data)) {
-      return data;
+      return z.array(record).parse(data);
     } else if (typeof data === 'object' && data !== null) {
-      return [data];
+      return [record.parse(data)];
     } else {
       throw new Error('JSON file must contain an array or object');
     }
   }
 
-  private async executeSQLFile(database: string, filePath: string): Promise<DatabaseOperationResult> {
+  private async executeSQLFile(database: string, filePath: string): Promise<DatabaseOperationResult<FileOperationData>> {
     const rl = createInterface({ input: createReadStream(filePath) });
     let buffer = '';
     let executedCount = 0;
@@ -340,7 +352,7 @@ export class ImportExportManager {
     };
   }
 
-  private generateCSV(columns: string[], rows: any[], options?: any): string {
+  private generateCSV(columns: string[], rows: DatabaseRow[], options?: ExportOptions): string {
     const delimiter = options?.delimiter || ',';
     const includeHeader = options?.includeHeader !== false;
     
@@ -364,12 +376,12 @@ export class ImportExportManager {
     return lines.join('\n');
   }
 
-  private generateJSON(rows: any[], options?: any): string {
+  private generateJSON(rows: DatabaseRow[], options?: ExportOptions): string {
     const pretty = options?.pretty !== false; // Default to true
     return pretty ? JSON.stringify(rows, null, 2) : JSON.stringify(rows);
   }
 
-  private generateSQL(table: string, columns: string[], rows: any[], options?: any): string {
+  private generateSQL(table: string, columns: string[], rows: DatabaseRow[]): string {
     let sql = '';
     
     for (const row of rows) {

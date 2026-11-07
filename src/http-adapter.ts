@@ -124,17 +124,20 @@ export class HttpAdapter {
           req.on('data', chunk => bodyBuffer.push(chunk));
           req.on('end', async () => {
             const rawBody = Buffer.concat(bodyBuffer).toString('utf8');
-            let parsedBody: any;
+            let parsedBody: unknown;
             try {
               parsedBody = rawBody ? JSON.parse(rawBody) : null;
             } catch {
               parsedBody = null;
             }
 
-            const method = parsedBody?.method || mcpMethod;
+            const envelope = typeof parsedBody === 'object' && parsedBody !== null && !Array.isArray(parsedBody)
+              ? parsedBody : {};
+            const method = 'method' in envelope && typeof envelope.method === 'string' ? envelope.method : mcpMethod;
+            const id = 'id' in envelope && (typeof envelope.id === 'string' || typeof envelope.id === 'number')
+              ? envelope.id : null;
 
             if (method === 'server/discover') {
-              const id = parsedBody?.id ?? null;
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({
                 jsonrpc: '2.0',
@@ -170,7 +173,7 @@ export class HttpAdapter {
                 res.end(JSON.stringify({
                   jsonrpc: '2.0',
                   error: { code: -32603, message: 'Internal server error', data: String(transportErr) },
-                  id: parsedBody?.id ?? null,
+                  id,
                 }));
               }
             }

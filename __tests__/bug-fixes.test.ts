@@ -35,6 +35,7 @@ describe('Bug Fixes (C1-C3, H1-H3, M1-M2)', () => {
     test('createDatabase creates a usable file', async () => {
       const result = await sqliteManager.createDatabase('test_usable');
       expect(result.success).toBe(true);
+      if (!result.data) throw new Error(result.error || 'Create returned no database path');
       expect(existsSync(result.data.path)).toBe(true);
     });
   });

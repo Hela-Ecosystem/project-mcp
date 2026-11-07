@@ -1,5 +1,7 @@
 import { SQLiteManager } from './sqlite-manager.js';
 import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
+import { DatabaseRow, DatabaseOperationResult, SqlExecutionData, memoryRowSchemas } from './types.js';
+import { z } from 'zod';
 import { ObsidianVaultMirror, uniqueObservations, observationHash } from './obsidian-vault.js';
 import { createHash } from 'crypto';
 import { sanitizePrivateContent } from './utils/sanitize.js';
@@ -7,6 +9,7 @@ import {
   ObservationProvenance,
   ensureObservationProvenanceSchema,
   recordObservationProvenance,
+  ProvenanceRowSchema,
 } from './observation-provenance.js';
 import { embedText, toVecString } from './vector-manager.js';
 import * as fs from 'fs';
@@ -216,8 +219,8 @@ export class MemoryManager {
       const vecStr = toVecString(vec);
       // rowid mapping to entities
       const row = await this.sqliteManager.executeSql(dbName, `SELECT rowid FROM entities WHERE name=?`, [entityName]);
-      if (!row.success || !row.data || row.data.rows.length === 0) return;
-      const rowid = (row.data.rows[0] as any).rowid ?? (row.data.rows[0] as any).ROWID;
+      if (!row.success || !row.data?.rows?.length) return;
+      const rowid = z.number().int().parse(row.data.rows[0].rowid ?? row.data.rows[0].ROWID);
       // vec0 upsert: delete then insert (vec0 has no UPDATE)
       await this.sqliteManager.executeSql(dbName, `DELETE FROM vec_entities WHERE rowid=?`, [rowid]);
       const ins = await this.sqliteManager.executeSql(dbName, `INSERT INTO vec_entities(rowid, embedding) VALUES (?, ?)`, [rowid, vecStr]);
@@ -254,7 +257,8 @@ export class MemoryManager {
           [entity.name]
         );
         if (prov.success && prov.data) {
-          for (const row of prov.data.rows as any[]) {
+          for (const value of prov.data.rows ?? []) {
+            const row = ProvenanceRowSchema.parse(value);
             const cp = await this.sqliteManager.executeSql(
               this.centralDbPath,
               `INSERT OR REPLACE INTO observation_provenance
@@ -302,10 +306,13 @@ export class MemoryManager {
       const centRelations = await this.sqliteManager.queryData(this.centralDbPath, 'relations', {}, 10000, 0);
       const aliasResult = await this.sqliteManager.queryData(this.memoryDbName, 'entity_aliases', {}, 100000);
       if (!aliasResult.success) throw new Error(aliasResult.error);
-      const aliases = new Map<string, string>((aliasResult.data?.rows || []).map((row: any) => [row.alias, row.canonical_name]));
-      const centralRelations: Relation[] = (centRelations.data?.rows || []).map((row: any) => this.rowToRelation(row));
+      const aliases = new Map<string, string>((aliasResult.data?.rows || []).map(value => {
+        const row = memoryRowSchemas.entity_aliases.parse(value);
+        return [row.alias, row.canonical_name];
+      }));
+      const centralRelations: Relation[] = (centRelations.data?.rows || []).map(row => this.rowToRelation(row));
       if (centEntities.success && centEntities.data) {
-        for (const row of centEntities.data.rows as any[]) {
+        for (const row of centEntities.data.rows) {
           const ent = this.rowToEntity(row);
           ent.observations = this.cleanObservations(ent, centralRelations);
           ent.name = aliases.get(ent.name) || ent.name;
@@ -316,7 +323,7 @@ export class MemoryManager {
         }
       }
       if (centRelations.success && centRelations.data) {
-        for (const row of centRelations.data.rows as any[]) {
+        for (const row of centRelations.data.rows) {
           const rel = this.rowToRelation(row);
           rel.from = aliases.get(rel.from) || rel.from;
           rel.to = aliases.get(rel.to) || rel.to;
@@ -364,7 +371,7 @@ export class MemoryManager {
     try {
       const res = await this.sqliteManager.queryData(this.memoryDbName, 'entities', {}, 100000, 0, 'updated_at', 'DESC');
       if (!res.success || !res.data) throw new Error(res.error || 'Could not read entities');
-      const entities = res.data.rows.map((row: any) => this.rowToEntity(row));
+      const entities = res.data.rows.map(row => this.rowToEntity(row));
       // group by normalized name
       const groups = new Map<string, Entity[]>();
       for (const e of entities) {
@@ -489,7 +496,7 @@ export class MemoryManager {
 
       // Verify the copy is readable before touching the original
       const probe = await this.sqliteManager.executeSql(this.centralDbPath, 'SELECT COUNT(*) as count FROM entities');
-      if (!probe.success || !probe.data || typeof probe.data.rows[0]?.count !== 'number') {
+      if (!probe.success || typeof probe.data?.rows?.[0]?.count !== 'number') {
         throw new Error(probe.error || 'central database probe failed');
       }
 
@@ -864,7 +871,10 @@ export class MemoryManager {
     try {
       const r = await this.sqliteManager.executeSql(this.memoryDbName, `SELECT from_entity, to_entity, relation_type FROM relations WHERE from_entity=? OR to_entity=?`, [name, name]);
       if (r.success && r.data) {
-        return r.data.rows.map((row: any) => ({ from: row.from_entity, to: row.to_entity, relationType: row.relation_type }));
+        return (r.data.rows ?? []).map(value => {
+          const row = memoryRowSchemas.relations.omit({ created_at: true }).parse(value);
+          return { from: row.from_entity, to: row.to_entity, relationType: row.relation_type };
+        });
       }
     } catch (e) { void e; }
     return [];
@@ -889,7 +899,7 @@ export class MemoryManager {
     let updatedAt = Number.isFinite(noteUpdated) ? new Date(noteUpdated).toISOString() : now;
     let createdAt = Number.isFinite(noteCreated) ? new Date(noteCreated).toISOString() : now;
     if (existing.success && existing.data && existing.data.rows.length > 0) {
-      const row = existing.data.rows[0];
+      const row = memoryRowSchemas.entities.parse(existing.data.rows[0]);
       const current = this.cleanObservations(this.rowToEntity(row), relations);
       const earliestCreated = Math.min(Date.parse(row.created_at), Date.parse(createdAt));
       createdAt = Number.isFinite(earliestCreated) ? new Date(earliestCreated).toISOString() : createdAt;
@@ -1021,9 +1031,9 @@ export class MemoryManager {
       const entitiesResult = await this.sqliteManager.queryData(this.memoryDbName, 'entities', {}, 100000, 0, 'updated_at', 'DESC');
       const relationsResult = await this.sqliteManager.queryData(this.memoryDbName, 'relations', {}, 100000, 0);
       const entities = (entitiesResult.success && entitiesResult.data)
-        ? entitiesResult.data.rows.map((row: any) => this.rowToEntity(row)) : [];
+        ? entitiesResult.data.rows.map(row => this.rowToEntity(row)) : [];
       const relations = (relationsResult.success && relationsResult.data)
-        ? relationsResult.data.rows.map((row: any) => this.rowToRelation(row)) : [];
+        ? relationsResult.data.rows.map(row => this.rowToRelation(row)) : [];
       for (const e of entities) {
         const rels = relations.filter((r: Relation) => r.from === e.name || r.to === e.name).map((r: Relation) => ({ from: r.from, to: r.to, relationType: r.relationType }));
         this.obsidianMirror.syncEntity(e, rels);
@@ -1039,7 +1049,9 @@ export class MemoryManager {
     const vaultPath = this.obsidianMirror.getVaultPath();
     let noteCount = 0;
     if (vaultPath) {
-      try { noteCount = this.obsidianMirror.listNotes().length; } catch {}
+    try { noteCount = this.obsidianMirror.listNotes().length; } catch (error) {
+      console.warn('Could not count vault notes:', error);
+    }
     }
     return { enabled, vaultPath, noteCount };
   }
@@ -1100,7 +1112,7 @@ export class MemoryManager {
       throw new Error(`Entity '${entityName}' does not exist`);
     }
 
-    const entity = result.data.rows[0];
+    const entity = memoryRowSchemas.entities.parse(result.data.rows[0]);
     const sanitizedContents = contents.map(c => sanitizePrivateContent(c));
     const currentObservations = this.safeParseObservations(entity.observations);
     const updatedObservations = uniqueObservations([...currentObservations, ...sanitizedContents]);
@@ -1173,7 +1185,7 @@ export class MemoryManager {
     let rowid: number | null = null;
     try {
       const r = await this.sqliteManager.executeSql(this.memoryDbName, `SELECT rowid FROM entities WHERE name=?`, [entityName]);
-      if (r.success && r.data && r.data.rows.length > 0) rowid = (r.data.rows[0] as { rowid: number }).rowid;
+      if (r.success && r.data?.rows?.length) rowid = z.number().int().parse(r.data.rows[0].rowid);
     } catch (e) { void e; }
     await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN TRANSACTION');
     try {
@@ -1211,7 +1223,7 @@ export class MemoryManager {
       throw new Error(`Entity '${entityName}' does not exist`);
     }
 
-    const entity = result.data.rows[0];
+    const entity = memoryRowSchemas.entities.parse(result.data.rows[0]);
     const currentObservations = this.safeParseObservations(entity.observations);
     const updatedObservations = currentObservations.filter((obs: string) => !observations.includes(obs));
     const now = new Date().toISOString();
@@ -1282,7 +1294,8 @@ export class MemoryManager {
     await this.syncToCentralSafe();
   }
 
-  private rowToEntity(row: any): Entity {
+  private rowToEntity(value: DatabaseRow): Entity {
+    const row = memoryRowSchemas.entities.parse(value);
     return {
       name: row.name,
       entityType: row.entity_type,
@@ -1292,7 +1305,8 @@ export class MemoryManager {
     };
   }
 
-  private rowToRelation(row: any): Relation {
+  private rowToRelation(value: DatabaseRow): Relation {
+    const row = memoryRowSchemas.relations.parse(value);
     return {
       from: row.from_entity,
       to: row.to_entity,
@@ -1324,10 +1338,10 @@ export class MemoryManager {
     const entitiesResult = await this.sqliteManager.queryData(database, 'entities', {}, limit, offset, 'updated_at', 'DESC');
     const relationsResult = await this.sqliteManager.queryData(database, 'relations', {}, limit, offset);
     const relations: Relation[] = (relationsResult.success && relationsResult.data)
-        ? relationsResult.data.rows.map((row: any) => this.rowToRelation(row))
+        ? relationsResult.data.rows.map(row => this.rowToRelation(row))
         : [];
     const entities: Entity[] = (entitiesResult.success && entitiesResult.data)
-      ? entitiesResult.data.rows.map((row: any) => this.rowToEntity(row)) : [];
+      ? entitiesResult.data.rows.map(row => this.rowToEntity(row)) : [];
     return { entities: entities.map(entity => ({ ...entity, observations: this.cleanObservations(entity, relations) })), relations };
   }
 
@@ -1342,18 +1356,18 @@ export class MemoryManager {
     return this.mergeGraphs([
       {
         entities: (projectResult.success && projectResult.data)
-          ? projectResult.data.rows.map((row: any) => this.rowToEntity(row))
+          ? projectResult.data.rows.map(row => this.rowToEntity(row))
           : [],
         relations: (projectRelations.success && projectRelations.data)
-          ? projectRelations.data.rows.map((row: any) => this.rowToRelation(row))
+          ? projectRelations.data.rows.map(row => this.rowToRelation(row))
           : []
       },
       {
         entities: (centralResult.success && centralResult.data)
-          ? centralResult.data.rows.map((row: any) => this.rowToEntity(row))
+          ? centralResult.data.rows.map(row => this.rowToEntity(row))
           : [],
         relations: (centralRelations.success && centralRelations.data)
-          ? centralRelations.data.rows.map((row: any) => this.rowToRelation(row))
+          ? centralRelations.data.rows.map(row => this.rowToRelation(row))
           : []
       }
     ]);
@@ -1372,18 +1386,18 @@ export class MemoryManager {
     if (cursor) {
       try {
         const json = Buffer.from(cursor, 'base64url').toString('utf8');
-        decoded = JSON.parse(json);
+        decoded = z.object({ updated_at: z.string(), name: z.string() }).parse(JSON.parse(json));
       } catch (e) { void e; }
     }
     // Use updated_at DESC, name ASC as tie-breaker
     const whereClause = decoded ? `WHERE (updated_at < ? OR (updated_at = ? AND name > ?))` : '';
-    const params: any[] = decoded ? [decoded.updated_at, decoded.updated_at, decoded.name] : [];
+    const params: unknown[] = decoded ? [decoded.updated_at, decoded.updated_at, decoded.name] : [];
     const projSql = `SELECT * FROM entities ${whereClause} ORDER BY updated_at DESC, name ASC LIMIT ${capped + 1}`;
     const [projRes, centRes] = await Promise.all([
       this.sqliteManager.executeSql(this.memoryDbName, projSql, params),
       this.sqliteManager.executeSql(this.centralDbPath, projSql, params),
     ]);
-    const toEnts = (r: any) => (r.success && r.data) ? r.data.rows.map((row: any) => this.rowToEntity(row)) : [];
+    const toEnts = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToEntity(row)) : [];
     const merged = this.mergeGraphs([{ entities: toEnts(projRes), relations: [] }, { entities: toEnts(centRes), relations: [] }]);
     // Sort merged by updated_at DESC, name ASC and slice
     merged.entities.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.name.localeCompare(b.name));
@@ -1405,7 +1419,7 @@ export class MemoryManager {
         this.sqliteManager.executeSql(this.memoryDbName, relSql, relParams),
         this.sqliteManager.executeSql(this.centralDbPath, relSql, relParams),
       ]);
-      const toRels = (r: any) => (r.success && r.data) ? r.data.rows.map((row: any) => this.rowToRelation(row)) : [];
+      const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
       relations = [...toRels(pr), ...toRels(cr)];
     }
     return { entities: page, relations, nextCursor };
@@ -1420,7 +1434,7 @@ export class MemoryManager {
       const sql = `SELECT e.* FROM entities e JOIN (SELECT rowid, distance FROM vec_entities WHERE embedding MATCH ? ORDER BY distance LIMIT ${limit}) v ON e.rowid = v.rowid`;
       const res = await this.sqliteManager.executeSql(dbName, sql, [vecStr]);
       if (!res.success || !res.data) return [];
-      return res.data.rows.map((row: any) => this.rowToEntity(row));
+      return (res.data.rows ?? []).map(row => this.rowToEntity(row));
     } catch (e) {
       console.warn(`vec search failed for ${dbName}:`, (e as Error).message);
       return [];
@@ -1434,7 +1448,7 @@ export class MemoryManager {
       this.sqliteManager.executeSql(this.memoryDbName, relationsQuery, [searchTerm, searchTerm, searchTerm]),
       this.sqliteManager.executeSql(this.centralDbPath, relationsQuery, [searchTerm, searchTerm, searchTerm])
     ]);
-    const toRels = (r: any) => (r.success && r.data) ? r.data.rows.map((row: any) => this.rowToRelation(row)) : [];
+    const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
     return [...toRels(pr), ...toRels(cr)];
   }
 
@@ -1475,7 +1489,7 @@ export class MemoryManager {
       
       // Fallback to basic LIKE if query is empty after sanitization
       if (!sanitizedQuery) {
-        return { entities: [], relations: [], detailLevel: detailLevel as any };
+        return { entities: [], relations: [], detailLevel: detailLevel === 'compact' || detailLevel === 'summary' ? detailLevel : 'full' };
       }
 
       // Search entities using FTS5 BM25 ranking
@@ -1502,10 +1516,10 @@ export class MemoryManager {
         this.sqliteManager.executeSql(this.centralDbPath, relationsQuery, [searchTerm, searchTerm, searchTerm])
       ]);
 
-      const toEntities = (result: { success: boolean; data?: any }) =>
-        (result.success && result.data) ? result.data.rows.map((row: any) => this.rowToEntity(row)) : [];
-      const toRelations = (result: { success: boolean; data?: any }) =>
-        (result.success && result.data) ? result.data.rows.map((row: any) => this.rowToRelation(row)) : [];
+      const toEntities = (result: DatabaseOperationResult<SqlExecutionData>) =>
+        result.success ? (result.data?.rows ?? []).map(row => this.rowToEntity(row)) : [];
+      const toRelations = (result: DatabaseOperationResult<SqlExecutionData>) =>
+        result.success ? (result.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
 
       rawResult = this.mergeGraphs([
         { entities: toEntities(projectEntities), relations: toRelations(projectRelations) },
@@ -1562,7 +1576,8 @@ export class MemoryManager {
 
   private safeParseObservations(json: string): string[] {
     try {
-      return JSON.parse(json);
+      const parsed: unknown = JSON.parse(json);
+      return z.array(z.string()).parse(parsed);
     } catch {
       return [];
     }
@@ -1606,7 +1621,7 @@ export class MemoryManager {
       this.sqliteManager.executeSql(this.centralDbPath, relQuery, [foundName, foundName]),
     ]);
 
-    const toRels = (r: any) => (r.success && r.data) ? r.data.rows.map((row: any) => this.rowToRelation(row)) : [];
+    const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
     const allRelations: Relation[] = [...toRels(pRel), ...toRels(cRel)];
     const uniqueRelations = allRelations.filter((r, idx, arr) =>
       arr.findIndex(x => x.from === r.from && x.to === r.to && x.relationType === r.relationType) === idx
@@ -1639,7 +1654,7 @@ export class MemoryManager {
     const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
 
     let sql = 'SELECT name, entity_type, observations, created_at, updated_at FROM entities WHERE 1=1';
-    const params: any[] = [];
+    const params: unknown[] = [];
 
     if (options.entityType) {
       sql += ' AND entity_type = ?';
@@ -1657,7 +1672,7 @@ export class MemoryManager {
       this.sqliteManager.executeSql(this.centralDbPath, sql, params),
     ]);
 
-    const toRows = (r: any) => (r.success && r.data) ? r.data.rows : [];
+    const toRows = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => memoryRowSchemas.entities.parse(row)) : [];
     const combinedRows = [...toRows(pRes), ...toRows(cRes)];
 
     const seen = new Set<string>();
@@ -1743,7 +1758,7 @@ export class MemoryManager {
     await this.ensureMissionsSchema(dbTarget);
 
     const conditions: string[] = [];
-    const params: any[] = [];
+    const params: unknown[] = [];
 
     if (filter.id) {
       conditions.push('id = ?');
@@ -1781,7 +1796,7 @@ export class MemoryManager {
       throw new Error(`Failed to list missions: ${queryRes.error}`);
     }
 
-    return (queryRes.data.rows || []).map((row: any) => this.mapMissionRow(row));
+    return (queryRes.data.rows || []).map(row => this.mapMissionRow(row));
   }
 
   async updateMission(input: UpdateMissionInput, dbSelector: 'project' | 'central' = 'project'): Promise<Mission> {
@@ -1800,7 +1815,7 @@ export class MemoryManager {
 
     const now = new Date().toISOString();
     const updates: string[] = ['updated_at = ?'];
-    const params: any[] = [now];
+    const params: unknown[] = [now];
 
     if (input.status !== undefined) {
       updates.push('status = ?');
@@ -1845,7 +1860,7 @@ export class MemoryManager {
     }
 
     const rows = await this.sqliteManager.executeSql(dbTarget, `SELECT * FROM missions WHERE id = ?`, [input.id]);
-    if (!rows.success || !rows.data || rows.data.rows.length === 0) {
+    if (!rows.success || !rows.data?.rows?.length) {
       throw new Error(`Mission not found: ${input.id}`);
     }
     if (isClaim && updateRes.data?.changes !== 1) {
@@ -1855,12 +1870,21 @@ export class MemoryManager {
     return this.mapMissionRow(rows.data.rows[0]);
   }
 
-  private mapMissionRow(row: any): Mission {
-    let payload = undefined;
+  private mapMissionRow(value: DatabaseRow): Mission {
+    const row = z.object({
+      id: z.string(), title: z.string(), description: z.string().nullable(),
+      origin_agent: z.string(), target_agent: z.string(),
+      status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']),
+      priority: z.enum(['low', 'normal', 'high', 'urgent']),
+      payload: z.string().nullable(), result: z.string().nullable(), error: z.string().nullable(),
+      claimed_by: z.string().nullable(), claimed_at: z.string().nullable(), completed_at: z.string().nullable(),
+      created_at: z.string(), updated_at: z.string(),
+    }).parse(value);
+    let payload: unknown = undefined;
     if (row.payload) {
       try { payload = JSON.parse(row.payload); } catch { payload = row.payload; }
     }
-    let result = undefined;
+    let result: unknown = undefined;
     if (row.result) {
       try { result = JSON.parse(row.result); } catch { result = row.result; }
     }

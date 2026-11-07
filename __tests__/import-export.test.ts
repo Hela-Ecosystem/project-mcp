@@ -53,6 +53,13 @@ describe('ImportExportManager', () => {
   });
 
   describe('CSV Import', () => {
+    test.each([[null], [42], [['nested']], [{ id: 1 }, null]])('rejects non-record JSON rows before inserting: %j', async (...values) => {
+      writeFileSync('./test.json', JSON.stringify(values));
+      const result = await importExportManager.importFromFile('test_db', 'users', './test.json', 'json');
+      expect(result.success).toBe(false);
+      expect((await sqliteManager.queryData('test_db', 'users')).data?.rows).toEqual([]);
+    });
+
     test('should import CSV with header', async () => {
       const csvContent = `id,name,email,age
 1,John Doe,john@example.com,30
@@ -69,12 +76,12 @@ describe('ImportExportManager', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.importedCount).toBe(2);
+      expect(result.data?.importedCount).toBe(2);
 
       // Verify data was inserted
       const queryResult = await sqliteManager.queryData('test_db', 'users');
-      expect(queryResult.data.rows).toHaveLength(2);
-      expect(queryResult.data.rows[0].name).toBe('John Doe');
+      expect(queryResult.data?.rows).toHaveLength(2);
+      expect(queryResult.data?.rows[0].name).toBe('John Doe');
     });
 
     test('should import CSV without header', async () => {
@@ -103,12 +110,12 @@ describe('ImportExportManager', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.importedCount).toBe(2);
+      expect(result.data?.importedCount).toBe(2);
 
       // Verify data was inserted
       const queryResult = await sqliteManager.queryData('test_db', 'csv_test');
-      expect(queryResult.data.rows).toHaveLength(2);
-      expect(queryResult.data.rows[0].column_2).toBe('John Doe');
+      expect(queryResult.data?.rows).toHaveLength(2);
+      expect(queryResult.data?.rows[0].column_2).toBe('John Doe');
     });
 
     test('should import CSV with custom delimiter', async () => {
@@ -127,7 +134,7 @@ describe('ImportExportManager', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.importedCount).toBe(2);
+      expect(result.data?.importedCount).toBe(2);
     });
   });
 
@@ -148,7 +155,7 @@ describe('ImportExportManager', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.importedCount).toBe(2);
+      expect(result.data?.importedCount).toBe(2);
     });
 
     test('should import JSON object', async () => {
@@ -169,7 +176,7 @@ describe('ImportExportManager', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.importedCount).toBe(1);
+      expect(result.data?.importedCount).toBe(1);
     });
   });
 
@@ -188,11 +195,11 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.executedCount).toBe(2);
+      expect(result.data?.executedCount).toBe(2);
 
       // Verify data was inserted
       const queryResult = await sqliteManager.queryData('test_db', 'users');
-      expect(queryResult.data.rows).toHaveLength(2);
+      expect(queryResult.data?.rows).toHaveLength(2);
     });
   });
 
@@ -216,7 +223,7 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.exportedCount).toBe(2);
+      expect(result.data?.exportedCount).toBe(2);
       expect(existsSync('./export.csv')).toBe(true);
 
       const content = readFileSync('./export.csv', 'utf8');
@@ -235,7 +242,7 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.exportedCount).toBe(2);
+      expect(result.data?.exportedCount).toBe(2);
 
       const content = readFileSync('./export.csv', 'utf8');
       expect(content).not.toContain('id,name,email,age');
@@ -253,7 +260,7 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.exportedCount).toBe(2);
+      expect(result.data?.exportedCount).toBe(2);
 
       const content = readFileSync('./export.csv', 'utf8');
       expect(content).toContain('id;name;email;age');
@@ -278,7 +285,7 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.exportedCount).toBe(2);
+      expect(result.data?.exportedCount).toBe(2);
       expect(existsSync('./export.json')).toBe(true);
 
       const content = readFileSync('./export.json', 'utf8');
@@ -306,7 +313,7 @@ INSERT INTO users (id, name, email, age) VALUES (2, 'Jane Smith', 'jane@example.
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.exportedCount).toBe(2);
+      expect(result.data?.exportedCount).toBe(2);
       expect(existsSync('./export.sql')).toBe(true);
 
       const content = readFileSync('./export.sql', 'utf8');

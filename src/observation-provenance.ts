@@ -12,6 +12,15 @@
  * write it annotates.
  */
 
+import { z } from 'zod';
+import type { DatabaseOperationResult, SqlExecutionData } from './types.js';
+
+export const ProvenanceRowSchema = z.object({
+  observation: z.string(), source: z.string(), retrieved_at: z.string(),
+  confidence: z.number().nullable().optional(),
+  freshness: z.enum(['fresh', 'cached', 'stale']).nullable().optional(),
+});
+
 export type ObservationFreshness = 'fresh' | 'cached' | 'stale';
 
 export interface ObservationProvenance {
@@ -30,8 +39,8 @@ export interface ProvenanceSqlExecutor {
   executeSql(
     database: string,
     query: string,
-    parameters?: any[],
-  ): Promise<{ success: boolean; error?: string; data?: any }>;
+    parameters?: unknown[],
+  ): Promise<Pick<DatabaseOperationResult<SqlExecutionData>, 'success' | 'error' | 'data'>>;
 }
 
 export const OBSERVATION_PROVENANCE_TABLE = 'observation_provenance';
@@ -111,12 +120,13 @@ export async function getObservationProvenance(
       [entityName],
     );
     if (!r.success || !r.data) return grouped;
-    for (const row of r.data.rows as any[]) {
+    for (const value of r.data.rows ?? []) {
+      const row = ProvenanceRowSchema.parse(value);
       const ref: ObservationProvenance = {
         source: row.source,
         retrieved_at: row.retrieved_at,
         ...(row.confidence !== null && row.confidence !== undefined ? { confidence: row.confidence } : {}),
-        ...(row.freshness ? { freshness: row.freshness as ObservationFreshness } : {}),
+        ...(row.freshness ? { freshness: row.freshness } : {}),
       };
       (grouped[row.observation] ??= []).push(ref);
     }

@@ -134,7 +134,9 @@ async function vaultCommand(directory: string, command: Command): Promise<unknow
       try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
     } finally {
       if (fd !== undefined) fs.closeSync(fd);
-      try { fs.unlinkSync(temporary); } catch (error) { if (!absent(error)) throw error; }
+      try { fs.unlinkSync(temporary); } catch (error) {
+        if (!absent(error)) process.stderr.write('Could not clean up temporary vault write\n');
+      }
     }
   }
 

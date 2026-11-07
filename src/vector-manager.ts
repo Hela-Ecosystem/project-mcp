@@ -1,7 +1,8 @@
-import { createRequire } from 'module';
+import type sqlite3 from 'sqlite3';
+import type { FeatureExtractionPipeline } from '@xenova/transformers';
 
-let extractor: any = null;
-let extractorPromise: Promise<any> | null = null;
+let extractor: FeatureExtractionPipeline | null = null;
+let extractorPromise: Promise<FeatureExtractionPipeline> | null = null;
 
 const MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const DIM = 384;
@@ -15,10 +16,7 @@ async function getExtractor() {
   extractorPromise = (async () => {
     // @xenova/transformers is ESM-only; dynamic import
     const { pipeline } = await import('@xenova/transformers');
-    // @ts-ignore - pipeline types are dynamic
-    const pipe = await (pipeline as any)('feature-extraction', MODEL_ID, {
-      // quantized: true // smaller model not needed
-    });
+    const pipe = await pipeline('feature-extraction', MODEL_ID);
     extractor = pipe;
     return pipe;
   })();
@@ -62,7 +60,8 @@ export async function embedTexts(texts: string[]): Promise<Float32Array[]> {
   for (const text of texts) {
     const output = await pipe(text, { pooling: 'mean', normalize: true });
     // output is Tensor with data Float32Array
-    const data = (output as any).data as Float32Array;
+    const data = output.data;
+    if (!(data instanceof Float32Array)) throw new Error('Embedding model returned non-float data');
     // ensure dim 384
     if (data.length !== DIM) {
       // truncate/pad (should not happen)
@@ -95,15 +94,15 @@ export function toVecString(vec: Float32Array): string {
 }
 
 // Lazy loader for sqlite-vec extension per db
-let vecLoadAttempted = new WeakMap<any, boolean>();
-export async function ensureVecExtension(db: any): Promise<boolean> {
-  if (vecLoadAttempted.has(db)) return true;
+const vecLoadAttempted = new WeakMap<sqlite3.Database, boolean>();
+export async function ensureVecExtension(db: sqlite3.Database): Promise<boolean> {
+  if (vecLoadAttempted.has(db)) return vecLoadAttempted.get(db)!;
   try {
     // sqlite-vec is ESM, dynamic import
     const vec = await import('sqlite-vec');
-    // @ts-ignore
-    if (vec.load) vec.load(db);
-    else if ((vec as any).default?.load) (vec as any).default.load(db);
+    await new Promise<void>((resolve, reject) => {
+      db.loadExtension(vec.getLoadablePath(), error => error ? reject(error) : resolve());
+    });
     vecLoadAttempted.set(db, true);
     return true;
   } catch (e) {

@@ -142,11 +142,12 @@ describe('Exclusive mission claims', () => {
       write: false,
     });
     const attempts = Array.from({ length: 4 }, (_, index) => {
-      const child = spawn(process.execPath, ['--input-type=module', '-e', bundled.outputFiles[0].text], {
+      const child = spawn(process.execPath, ['--input-type=module'], {
         cwd: projectRoot,
         env: { ...process.env, NODE_OPTIONS: '', CLAIM_DB_DIR: root, CLAIM_ID: mission.id, CLAIM_AGENT: `process-${index}` },
-        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+        stdio: ['pipe', 'ignore', 'pipe', 'ipc'],
       });
+      child.stdin!.end(bundled.outputFiles[0].text);
       children.push(child);
       let stderr = '';
       child.stderr!.on('data', chunk => { stderr += chunk; });

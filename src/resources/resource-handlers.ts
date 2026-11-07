@@ -245,8 +245,8 @@ export class ResourceHandlers {
       );
 
       return JSON.stringify({
-        recentEntities: recentEntities.success ? recentEntities.data.rows : [],
-        recentRelations: recentRelations.success ? recentRelations.data.rows : [],
+        recentEntities: recentEntities.success ? recentEntities.data?.rows ?? [] : [],
+        recentRelations: recentRelations.success ? recentRelations.data?.rows ?? [] : [],
         generatedAt: new Date().toISOString()
       });
     } catch (error) {
@@ -289,28 +289,31 @@ export class ResourceHandlers {
       // Process results
       const entityTypeMap: Record<string, number> = {};
       if (entitiesByType.success && entitiesByType.data) {
-        entitiesByType.data.rows.forEach((row: any) => {
-          entityTypeMap[row.entity_type] = row.count;
+        entitiesByType.data.rows?.forEach(row => {
+          if (typeof row.entity_type === 'string' && typeof row.count === 'number') entityTypeMap[row.entity_type] = row.count;
         });
       }
 
       const relationTypeMap: Record<string, number> = {};
       if (relationsByType.success && relationsByType.data) {
-        relationsByType.data.rows.forEach((row: any) => {
-          relationTypeMap[row.relation_type] = row.count;
+        relationsByType.data.rows?.forEach(row => {
+          if (typeof row.relation_type === 'string' && typeof row.count === 'number') relationTypeMap[row.relation_type] = row.count;
         });
       }
 
       // Calculate connectivity metrics
-      const avgRelationsPerEntity = totalEntities.success && totalEntities.data &&
-        totalEntities.data.rows[0]?.count > 0 && totalRelations.success && totalRelations.data
-        ? (totalRelations.data.rows[0]?.count / totalEntities.data.rows[0]?.count).toFixed(2)
+      const entityCount = totalEntities.success ? totalEntities.data?.rows?.[0]?.count : 0;
+      const relationCount = totalRelations.success ? totalRelations.data?.rows?.[0]?.count : 0;
+      const numEntities = typeof entityCount === 'number' ? entityCount : 0;
+      const numRelations = typeof relationCount === 'number' ? relationCount : 0;
+      const avgRelationsPerEntity = numEntities > 0
+        ? (numRelations / numEntities).toFixed(2)
         : '0.00';
 
       return JSON.stringify({
         overview: {
-          totalEntities: totalEntities.success ? totalEntities.data.rows[0]?.count || 0 : 0,
-          totalRelations: totalRelations.success ? totalRelations.data.rows[0]?.count || 0 : 0,
+          totalEntities: numEntities,
+          totalRelations: numRelations,
           totalEntityTypes: Object.keys(entityTypeMap).length,
           totalRelationTypes: Object.keys(relationTypeMap).length,
           avgRelationsPerEntity: parseFloat(avgRelationsPerEntity),
@@ -327,7 +330,7 @@ export class ResourceHandlers {
           connectivityRatio: parseFloat(avgRelationsPerEntity),
           entityTypeDiversity: Object.keys(entityTypeMap).length,
           relationTypeDiversity: Object.keys(relationTypeMap).length,
-          dataCompleteness: totalEntities.success && totalEntities.data.rows[0]?.count > 0 ? 'good' : 'empty',
+          dataCompleteness: numEntities > 0 ? 'good' : 'empty',
         },
         lastUpdated: new Date().toISOString(),
         cacheNote: 'Real-time statistics calculated from the current knowledge graph state.'

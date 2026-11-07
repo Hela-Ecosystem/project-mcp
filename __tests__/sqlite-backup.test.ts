@@ -67,6 +67,7 @@ describe('SQLite backup and new-destination restore', () => {
     const result = await manager.restoreDatabase(backupPath, 'restored');
     expect(result.success).toBe(true);
     expect(result.data).toEqual({ databaseName: 'restored', path: join(directory, 'databases', 'restored.db') });
+    if (!result.data) throw new Error(result.error || 'Restore returned no database path');
     const restored = await open(result.data.path);
     expect(await rows(restored, 'PRAGMA integrity_check')).toEqual([{ integrity_check: 'ok' }]);
     expect(await rows(restored, 'SELECT * FROM records')).toEqual([{ id: 1, value: 'committed in WAL' }]);
@@ -88,7 +89,7 @@ describe('SQLite backup and new-destination restore', () => {
     expect((await manager.restoreDatabase(backupPath, 'restored-vectors')).success).toBe(true);
     const result = await manager.executeSql('restored-vectors', 'SELECT rowid FROM embeddings');
     expect(result.success).toBe(true);
-    expect(result.data.rows).toEqual([{ rowid: 1 }]);
+    expect(result.data?.rows).toEqual([{ rowid: 1 }]);
   });
 
   test.each(['text', 'empty', 'truncated', 'invalid-pages'])('rejects a malformed %s backup without publishing a destination', async kind => {
@@ -126,7 +127,7 @@ describe('SQLite backup and new-destination restore', () => {
     expect(readFileSync(livePath)).toEqual(original);
     const query = await manager.executeSql('live', 'SELECT * FROM live_data');
     expect(query.success).toBe(true);
-    expect(query.data.rows).toEqual([{ value: 'keep me' }]);
+    expect(query.data?.rows).toEqual([{ value: 'keep me' }]);
   });
 
   test.each(['file', 'directory', 'symlink', 'dangling-symlink', 'hardlink', 'wal', 'shm', 'journal', 'dangling-wal'])('refuses a destination occupied by %s and preserves it', async kind => {

@@ -118,7 +118,7 @@ AgentSkills provide host-side workflows and instructions. The MCP runtime implem
 - **Input Validation**: Zod schema validation for all parameters
 - **Error Recovery**: Graceful error handling with detailed error messages
 - **Resource Management**: Automatic cleanup of connections and resources
-- **Testing**: The current isolated regression run passes 19 suites / 248 tests, including vault conflicts, replicated timestamp/order convergence, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service.
+- **Testing**: The current isolated regression run passes 19 suites / 263 tests, including vault conflicts, replicated timestamp/order convergence, typed request/import validation, SQL binding validation, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service. `npm run lint` checks every source TypeScript file and fails on any warning; the current run has zero errors and zero warnings.
 
 ## Requirements
 

@@ -59,13 +59,13 @@ export const DropTableSchema = z.object({
 export const InsertDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  records: z.array(z.record(z.string(), z.any())).min(1),
+  records: z.array(z.record(z.string(), z.unknown())).min(1),
 });
 
 export const QueryDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.string(), z.any()).optional(),
+  conditions: z.record(z.string(), z.unknown()).optional(),
   limit: z.number().min(1).max(10000).optional(),
   offset: z.number().min(0).optional(),
   orderBy: z.string().optional(),
@@ -75,27 +75,27 @@ export const QueryDataSchema = z.object({
 export const UpdateDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.string(), z.any()),
-  updates: z.record(z.string(), z.any()),
+  conditions: z.record(z.string(), z.unknown()),
+  updates: z.record(z.string(), z.unknown()),
 });
 
 export const DeleteDataSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.string(), z.any()),
+  conditions: z.record(z.string(), z.unknown()),
 });
 
 export const CountRecordsSchema = z.object({
   database: z.string().min(1),
   table: z.string().min(1),
-  conditions: z.record(z.string(), z.any()).optional(),
+  conditions: z.record(z.string(), z.unknown()).optional(),
 });
 
 // Advanced operations schemas
 export const ExecuteSqlSchema = z.object({
   database: z.string().min(1),
   query: z.string().min(1),
-  parameters: z.array(z.any()).optional(),
+  parameters: z.array(z.unknown()).optional(),
 });
 
 export const ImportFromFileSchema = z.object({
@@ -115,7 +115,7 @@ export const ExportToFileSchema = z.object({
   table: z.string().min(1),
   filePath: z.string().min(1),
   format: z.enum(['csv', 'json', 'sql']).default('csv'),
-  conditions: z.record(z.string(), z.any()).optional(),
+  conditions: z.record(z.string(), z.unknown()).optional(),
   options: z.object({
     delimiter: z.string().optional(),
     includeHeader: z.boolean().optional(),
@@ -437,19 +437,37 @@ export interface IndexInfo {
   type: string;
 }
 
-export interface QueryResult {
+export type DatabaseRow = Record<string, unknown>;
+export const memoryRowSchemas = {
+  entities: z.object({ name: z.string(), entity_type: z.string(), observations: z.string(), created_at: z.string(), updated_at: z.string() }).passthrough(),
+  relations: z.object({ from_entity: z.string(), to_entity: z.string(), relation_type: z.string(), created_at: z.string() }).passthrough(),
+  entity_aliases: z.object({ alias: z.string(), canonical_name: z.string() }).passthrough(),
+};
+export type TableSchema = z.infer<typeof CreateTableSchema>['schema'];
+export type ImportOptions = z.infer<typeof ImportFromFileSchema>['options'];
+export type ExportOptions = z.infer<typeof ExportToFileSchema>['options'] & { pretty?: boolean };
+
+export interface QueryData<Row = DatabaseRow> {
   columns: string[];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  rows: any[];
+  rows: Row[];
   rowCount: number;
+}
+
+export interface QueryResult<Row = DatabaseRow> extends QueryData<Row> {
   executionTime: number;
 }
 
-export interface DatabaseOperationResult {
+export interface SqlExecutionData {
+  columns?: string[];
+  rows?: DatabaseRow[];
+  rowCount?: number;
+  changes?: number;
+}
+
+export interface DatabaseOperationResult<Data = unknown> {
   success: boolean;
   message: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  data?: any;
+  data?: Data;
   error?: string;
   executionTime?: number;
 }
@@ -563,8 +581,8 @@ export interface Mission {
   targetAgent: string;
   status: MissionStatus;
   priority: MissionPriority;
-  payload?: any;
-  result?: any;
+  payload?: unknown;
+  result?: unknown;
   error?: string;
   claimedBy?: string;
   claimedAt?: string;
@@ -579,7 +597,7 @@ export const CreateMissionSchema = z.object({
   originAgent: z.string().min(1).max(100).default('agent'),
   targetAgent: z.string().min(1).max(100).default('any'),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).default('normal'),
-  payload: z.any().optional(),
+  payload: z.unknown().optional(),
   database: z.enum(['project', 'central']).default('project').optional(),
 });
 
@@ -598,7 +616,7 @@ export const UpdateMissionSchema = z.object({
   id: z.string().min(1),
   status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']).optional(),
   claimedBy: z.string().trim().min(1).max(100).optional(),
-  result: z.any().optional(),
+  result: z.unknown().optional(),
   error: z.string().max(10000).optional(),
   database: z.enum(['project', 'central']).default('project').optional(),
 }).refine(input => input.status !== 'claimed' || input.claimedBy !== undefined, {
