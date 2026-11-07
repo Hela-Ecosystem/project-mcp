@@ -154,7 +154,7 @@ export class ObsidianVaultMirror {
       if (section === 'relations' && m) relationBullets.add(m[1].trim());
       if (section !== 'observations') continue;
       if (m) observations.push(m[1].trim());
-        else if (line.startsWith('  ') && observations.length) observations[observations.length - 1] += '\n' + line.slice(2);
+      else if (line.startsWith('  ') && observations.length) observations[observations.length - 1] += '\n' + line.slice(2);
     }
     return {
       name, entityType,
@@ -247,6 +247,10 @@ export class ObsidianVaultMirror {
       ].join('\n');
       const outgoing = (relations || []).filter((r) => r.from === entity.name);
       const incoming = (relations || []).filter((r) => r.to === entity.name);
+      const relationLines = [...new Set([
+        ...outgoing.map(r => `- [[${r.to}]] — ${r.relationType}`),
+        ...incoming.map(r => `- [[${r.from}]] — ${r.relationType} (incoming)`),
+      ])].sort();
       const body = [
         `# ${entity.name}`,
         '',
@@ -258,9 +262,7 @@ export class ObsidianVaultMirror {
         '',
         '## Relations',
         '',
-        ...new Set(outgoing.map((r) => `- [[${r.to}]] — ${r.relationType}`)),
-        ...new Set(incoming.map((r) => `- [[${r.from}]] — ${r.relationType} (incoming)`)),
-        ...((outgoing.length || incoming.length) ? [] : ['_(none)_']),
+        ...(relationLines.length ? relationLines : ['_(none)_']),
         '',
       ].join('\n');
       const content = frontmatter + body;

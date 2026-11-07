@@ -97,6 +97,23 @@ describe('Optional vault mirror and idempotent memory sync', () => {
     expect((await noteFor('service:alpha')).content).toBe(stable);
   });
 
+  test('relation rendering is stable across database insertion orders', async () => {
+    await memory.createEntity('service:alpha', 'service', ['Fact']);
+    const entity = (await memory.openNode('service:alpha'))!;
+    const relations = [
+      { from: 'service:alpha', to: 'service:zeta', relationType: 'uses' },
+      { from: 'service:beta', to: 'service:alpha', relationType: 'calls' },
+      { from: 'service:alpha', to: 'service:beta', relationType: 'uses' },
+    ];
+    mirror.syncEntity(entity, relations);
+    const before = await noteFor(entity.name);
+    mirror.syncEntity(entity, [...relations].reverse());
+    expect((await noteFor(entity.name)).content).toBe(before.content);
+    expect(before.content.match(/^- \[\[.*$/gm)).toEqual([
+      '- [[service:beta]] — calls (incoming)', '- [[service:beta]] — uses', '- [[service:zeta]] — uses',
+    ]);
+  });
+
   test('fresh imports preserve the source creation and update dates', async () => {
     mirror.syncEntity({ name: 'service:imported', entityType: 'service', observations: ['Fact'],
       createdAt: '2000-01-01T00:00:00.000Z', updatedAt: '2001-01-01T00:00:00.000Z' });

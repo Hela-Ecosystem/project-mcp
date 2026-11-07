@@ -118,7 +118,7 @@ AgentSkills provide host-side workflows and instructions. The MCP runtime implem
 - **Input Validation**: Zod schema validation for all parameters
 - **Error Recovery**: Graceful error handling with detailed error messages
 - **Resource Management**: Automatic cleanup of connections and resources
-- **Testing**: The current isolated regression run passes 19 suites / 263 tests, including vault conflicts, replicated timestamp/order convergence, typed request/import validation, SQL binding validation, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service. `npm run lint` checks every source TypeScript file and fails on any warning; the current run has zero errors and zero warnings.
+- **Testing**: The current isolated regression run passes 19 suites / 264 tests, including vault conflicts, replicated timestamp/observation/relation-order convergence, typed request/import validation, SQL binding validation, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service. `npm run lint` checks every source TypeScript file and fails on any warning; the current run has zero errors and zero warnings.
 
 ## Requirements
 
@@ -479,7 +479,7 @@ Set `HELA_GENOME_OBSIDIAN_VAULT=/path/to/vault` to enable the optional Markdown 
 
 The watcher polls every two seconds and serializes imports. Human observation changes replace the rendered baseline only if SQLite still matches it; divergent agent/human edits merge their observations. Previous note revisions are retained under `.hela-conflicts/`. Hidden directories are excluded from imports. Deletions are inferred only for notes previously observed by that running watcher, using frontmatter identity; a missing or unreadable vault fails closed. Absence on startup is not a deletion instruction. Central memory is additive: a later explicit central import may restore a project-deleted entity.
 
-Replicated notes retain the earliest creation date and latest update date instead of rewriting remote timestamps to local ones. A replicated observation superset can retain its incoming order without dropping database-only facts. These rules prevent timestamp/order-only sync loops; genuinely divergent notes still require a deliberate resolution.
+Replicated notes retain the earliest creation date and latest update date instead of rewriting remote timestamps to local ones. A replicated observation superset can retain its incoming order without dropping database-only facts. Relation links use a canonical order independent of database insertion order. These rules prevent timestamp/order-only sync loops; genuinely divergent notes still require a deliberate resolution.
 
 #### Conflict-aware synchronization between machines
 
