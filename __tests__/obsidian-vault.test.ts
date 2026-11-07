@@ -66,6 +66,46 @@ describe('Optional vault mirror and idempotent memory sync', () => {
     expect((await memory.openNode('service:alpha'))?.observations).toEqual(['Keep this']);
   });
 
+  test('replicated timestamps converge without rewriting newer metadata back to local dates', async () => {
+    await memory.createEntity('service:alpha', 'service', ['Fact']);
+    await sqlite.updateData('memory', 'entities', { name: 'service:alpha' }, {
+      created_at: '2000-01-01T00:00:00.000Z', updated_at: '2001-01-01T00:00:00.000Z',
+    });
+    await memory.backfillVault();
+    const note = await noteFor('service:alpha');
+    writeFileSync(note.path, note.content.replace('created: 2000-01-01', 'created: 1999-01-01').replace('updated: 2001-01-01', 'updated: 2002-01-01'));
+    await memory.rebuildFromVault();
+    const stable = readFileSync(note.path, 'utf8');
+    for (let index = 0; index < 3; index++) {
+      await memory.rebuildFromVault();
+      await memory.backfillVault();
+    }
+    expect(await memory.openNode('service:alpha')).toEqual(expect.objectContaining({
+      createdAt: '1999-01-01T00:00:00.000Z', updatedAt: '2002-01-01T00:00:00.000Z', observations: ['Fact'],
+    }));
+    expect(readFileSync(note.path, 'utf8')).toBe(stable);
+  });
+
+  test('a replicated observation superset adopts its order without losing database-only facts', async () => {
+    await memory.createEntity('service:alpha', 'service', ['Second', 'First']);
+    const entity = (await memory.openNode('service:alpha'))!;
+    mirror.syncEntity({ ...entity, observations: ['First', 'Second', 'Third'] }, [], true);
+    await memory.rebuildFromVault();
+    expect((await memory.openNode('service:alpha'))?.observations).toEqual(['First', 'Second', 'Third']);
+    const stable = (await noteFor('service:alpha')).content;
+    await memory.rebuildFromVault();
+    expect((await noteFor('service:alpha')).content).toBe(stable);
+  });
+
+  test('fresh imports preserve the source creation and update dates', async () => {
+    mirror.syncEntity({ name: 'service:imported', entityType: 'service', observations: ['Fact'],
+      createdAt: '2000-01-01T00:00:00.000Z', updatedAt: '2001-01-01T00:00:00.000Z' });
+    await memory.rebuildFromVault();
+    expect(await memory.openNode('service:imported')).toEqual(expect.objectContaining({
+      createdAt: '2000-01-01T00:00:00.000Z', updatedAt: '2001-01-01T00:00:00.000Z',
+    }));
+  });
+
   test('a fresh SQLite database can rebuild entities and edges from managed vault notes', async () => {
     await memory.createEntity('project:alpha', 'project', ['Project']);
     await memory.createEntity('service:alpha', 'service', ['Service']);

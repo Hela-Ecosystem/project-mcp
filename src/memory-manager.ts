@@ -884,28 +884,34 @@ export class MemoryManager {
     const existing = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name });
     if (!existing.success) throw new Error(existing.error);
     const now = new Date().toISOString();
-    let updatedAt = now;
-    let createdAt = parsed.createdAt && !isNaN(Date.parse(parsed.createdAt)) ? parsed.createdAt : now;
+    const noteUpdated = Date.parse(parsed.updatedAt ?? '');
+    const noteCreated = Date.parse(parsed.createdAt ?? '');
+    let updatedAt = Number.isFinite(noteUpdated) ? new Date(noteUpdated).toISOString() : now;
+    let createdAt = Number.isFinite(noteCreated) ? new Date(noteCreated).toISOString() : now;
     if (existing.success && existing.data && existing.data.rows.length > 0) {
       const row = existing.data.rows[0];
       const current = this.cleanObservations(this.rowToEntity(row), relations);
-      createdAt = row.created_at;
-      updatedAt = row.updated_at;
+      const earliestCreated = Math.min(Date.parse(row.created_at), Date.parse(createdAt));
+      createdAt = Number.isFinite(earliestCreated) ? new Date(earliestCreated).toISOString() : createdAt;
+      const latestUpdated = Math.max(Date.parse(row.updated_at), Number.isFinite(noteUpdated) ? noteUpdated : Date.parse(row.updated_at));
+      updatedAt = Number.isFinite(latestUpdated) ? new Date(latestUpdated).toISOString() : updatedAt;
       const matchesBase = parsed.mirrorHash
         ? parsed.mirrorHash === observationHash({ entityType: row.entity_type, observations: current })
         : parsed.updatedAt === row.updated_at;
       if (!matchesBase) {
-        observations = uniqueObservations([...current, ...observations]);
+        if (!current.every(value => observations.includes(value))) observations = uniqueObservations([...current, ...observations]);
         entityType = row.entity_type;
       }
       const changed = row.entity_type !== entityType || JSON.stringify(current) !== JSON.stringify(observations);
-      if (changed || JSON.stringify(this.safeParseObservations(row.observations)) !== JSON.stringify(observations)) {
-        updatedAt = now;
+      if (changed) updatedAt = new Date(Math.max(Date.parse(updatedAt), Date.parse(now))).toISOString();
+      if (changed || row.created_at !== createdAt || row.updated_at !== updatedAt
+          || JSON.stringify(this.safeParseObservations(row.observations)) !== JSON.stringify(observations)) {
         const update = await this.sqliteManager.updateData(this.memoryDbName, 'entities', {
-          name, updated_at: row.updated_at, observations: row.observations, entity_type: row.entity_type,
+          name, created_at: row.created_at, updated_at: row.updated_at, observations: row.observations, entity_type: row.entity_type,
         }, {
           entity_type: entityType,
           observations: JSON.stringify(observations),
+          created_at: createdAt,
           updated_at: updatedAt,
         });
         if (!update.success || update.data?.changes !== 1) throw new Error('Vault import changed concurrently; retry sync');

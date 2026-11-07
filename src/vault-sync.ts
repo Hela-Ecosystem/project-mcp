@@ -31,7 +31,9 @@ export interface VaultSyncOptions {
   timeoutMs?: number;
   maxBytes?: number;
   /** Runs under both locks, after snapshots and before writes. */
-  beforeApply?: () => void | Promise<void>;
+  beforeApply?: (result: Readonly<VaultSyncResult>) => void | Promise<void>;
+  /** Explicit repair policy; undefined leaves the conflict unresolved. Originals are archived. */
+  resolveConflict?: (name: string, local: Buffer | null, peer: Buffer | null) => Buffer | undefined;
 }
 
 export interface VaultSyncResult {
@@ -325,6 +327,7 @@ export async function syncVaults(localDir: string, peerDir: string, options: Vau
   if (![localDir, peerDir].every(value => typeof value === 'string' && value.length > 0 && !value.includes('\0')) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120000 ||
       !Number.isInteger(maxBytes) || maxBytes < 16384 || maxBytes > 64 * 1024 * 1024 ||
+      (options.resolveConflict !== undefined && typeof options.resolveConflict !== 'function') ||
       (options.remote !== undefined && !/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(options.remote)))
     throw new VaultSyncError('INVALID_ARGUMENT');
   const local = resolve(localDir);
@@ -378,19 +381,33 @@ export async function syncVaults(localDir: string, peerDir: string, options: Vau
         next[name] = source?.hash ?? null;
         if (source) result.copied++; else result.deleted++;
       } else {
-        result.conflicts.push(name);
         const versions = [a, b].sort();
         const key = digest(JSON.stringify([name, versions]));
         const record = JSON.stringify({ path: name, hashes: versions, deletion: a === null || b === null });
         archives.push({ path: `.hela-sync/conflicts/${key}/${digest(record)}.json`, data: Buffer.from(record).toString('base64') });
         for (const file of [left.files[name], right.files[name]]) if (file)
           archives.push({ path: `.hela-sync/conflicts/${key}/${file.hash}.bin`, data: file.data });
+        const resolved = options.resolveConflict?.(name,
+          left.files[name] ? Buffer.from(left.files[name].data, 'base64') : null,
+          right.files[name] ? Buffer.from(right.files[name].data, 'base64') : null);
+        if (resolved !== undefined) {
+          if (!Buffer.isBuffer(resolved)) throw new VaultSyncError('INVALID_ARGUMENT');
+          if (resolved.length > maxBytes) throw new VaultSyncError('LIMIT_EXCEEDED');
+          const mergedHash = createHash('sha256').update(resolved).digest('hex');
+          for (const [operations, expected] of [[localOps, a], [peerOps, b]] as const) {
+            if (expected !== mergedHash) {
+              operations.push({ path: name, expected, data: resolved.toString('base64') });
+              result.copied++;
+            }
+          }
+          next[name] = mergedHash;
+        } else result.conflicts.push(name);
       }
     }
     const unchanged = left.state && right.state && left.state.generation === right.state.generation &&
       JSON.stringify(left.state.files) === JSON.stringify(next) && JSON.stringify(right.state.files) === JSON.stringify(next);
     const state: Baseline = { version: 1, generation: unchanged ? left.state!.generation : randomUUID(), files: next };
-    await options.beforeApply?.();
+    await options.beforeApply?.(Object.freeze({ ...result, conflicts: [...result.conflicts] }));
     await runLocal({ ...common, action: 'apply', peerId: right.id, expected: hashes(left),
       operations: localOps, archives, state, stateHash: left.stateHash });
     await runPeer({ ...common, action: 'apply', peerId: left.id, expected: hashes(right),

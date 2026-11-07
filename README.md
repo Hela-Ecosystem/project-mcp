@@ -118,7 +118,7 @@ AgentSkills provide host-side workflows and instructions. The MCP runtime implem
 - **Input Validation**: Zod schema validation for all parameters
 - **Error Recovery**: Graceful error handling with detailed error messages
 - **Resource Management**: Automatic cleanup of connections and resources
-- **Testing**: The current isolated regression run passes 19 suites / 242 tests, including vault conflicts, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service.
+- **Testing**: The current isolated regression run passes 19 suites / 248 tests, including vault conflicts, replicated timestamp/order convergence, WAL-safe backups, mission contention, and vector retrieval. Historical UI tests do not imply an available UI service.
 
 ## Requirements
 
@@ -479,6 +479,8 @@ Set `HELA_GENOME_OBSIDIAN_VAULT=/path/to/vault` to enable the optional Markdown 
 
 The watcher polls every two seconds and serializes imports. Human observation changes replace the rendered baseline only if SQLite still matches it; divergent agent/human edits merge their observations. Previous note revisions are retained under `.hela-conflicts/`. Hidden directories are excluded from imports. Deletions are inferred only for notes previously observed by that running watcher, using frontmatter identity; a missing or unreadable vault fails closed. Absence on startup is not a deletion instruction. Central memory is additive: a later explicit central import may restore a project-deleted entity.
 
+Replicated notes retain the earliest creation date and latest update date instead of rewriting remote timestamps to local ones. A replicated observation superset can retain its incoming order without dropping database-only facts. These rules prevent timestamp/order-only sync loops; genuinely divergent notes still require a deliberate resolution.
+
 #### Conflict-aware synchronization between machines
 
 Build with `npm run build`, then configure both legacy hook names to the same **two-way** transport. The pull hook runs asynchronously at startup and before explicit sync; the write hook is debounced and serialized. Hook failures reach explicit callers; background failures are logged without printing command contents. Legacy `rsync --delete` hooks are rejected.
@@ -494,6 +496,7 @@ Both directories must already exist. The peer requires SSH access and Node.js, b
 - First sync unions missing files; it never treats initial absence as deletion.
 - A shared hash baseline permits one-sided edits and deletions only when the other side is unchanged. Divergent edits and edit/delete conflicts leave both canonical states untouched and archive both available revisions plus deletion intent in `.hela-sync/conflicts/` on both machines.
 - Overwritten or deleted revisions are retained in `.hela-sync/recovery/`. Archives contain `.bin` content plus JSON path/hash records. Resolve conflicts by copying the chosen/merged content to both canonical paths, or deleting both copies, then rerun sync.
+- Programmatic repairs can opt into `syncVaults(..., { resolveConflict })`. Return a `Buffer` containing reviewed merged content, or `undefined` to leave the conflict unresolved. Both originals are archived before publication. `beforeApply(result)` runs under both locks and can reject the complete copy/delete/conflict plan before canonical files change. The CLI does not enable a resolution policy automatically.
 - Exit codes: `0` synchronized, `2` unresolved conflicts, `1` failed/unavailable. Missing peers, corrupt metadata, and failed SSH commands are not empty snapshots.
 - Locks serialize cooperating synchronizers; expected-hash checks reject stale snapshots. Editors do not honor these locks, so do not treat this as a distributed filesystem transaction. Interrupted or mismatched baselines fall back to conservative reconciliation. Recovery archives preserve replaced data.
 - Non-hidden regular files, including attachments, are managed; `.obsidian/`, `.hela-sync/`, and other hidden paths are excluded. Symlinks, hardlinks, overlapping local roots, and oversized snapshots are rejected. Default transport limit is 32 MiB per operation with a conservative snapshot budget; the exported API accepts up to 64 MiB.

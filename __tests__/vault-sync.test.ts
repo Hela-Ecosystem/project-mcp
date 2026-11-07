@@ -103,6 +103,42 @@ describe('Conflict-aware vault transport', () => {
     expect((await syncVaults(left, right)).deleted).toBe(0);
   });
 
+  test('an explicit repair policy archives both originals and establishes an idempotent shared baseline', async () => {
+    writeFileSync(join(left, 'note.md'), 'left fact');
+    writeFileSync(join(right, 'note.md'), 'right fact');
+    const resolveConflict = (name: string, a: Buffer | null, b: Buffer | null) =>
+      name === 'note.md' && a && b ? Buffer.concat([a, Buffer.from('\n'), b]) : undefined;
+    expect(await syncVaults(left, right, { resolveConflict })).toEqual({ copied: 2, deleted: 0, conflicts: [] });
+    for (const vault of [left, right]) {
+      expect(text(vault, 'note.md')).toBe('left fact\nright fact');
+      expect(archiveFiles(vault, 'conflicts')).toEqual(expect.arrayContaining(['left fact', 'right fact']));
+      expect(archiveFiles(vault, 'recovery')).toContain(vault === left ? 'left fact' : 'right fact');
+    }
+    expect(await syncVaults(left, right)).toEqual({ copied: 0, deleted: 0, conflicts: [] });
+  });
+
+  test('repair policies can decline conflicts and cannot publish oversized results', async () => {
+    writeFileSync(join(left, 'note.md'), 'left');
+    writeFileSync(join(right, 'note.md'), 'right');
+    expect((await syncVaults(left, right, { resolveConflict: () => undefined })).conflicts).toEqual(['note.md']);
+    await expect(syncVaults(left, right, { maxBytes: 16384, resolveConflict: () => Buffer.alloc(16385) }))
+      .rejects.toMatchObject({ code: 'LIMIT_EXCEEDED' });
+    expect(text(left, 'note.md')).toBe('left');
+    expect(text(right, 'note.md')).toBe('right');
+    expect((await syncVaults(left, right)).conflicts).toEqual(['note.md']);
+  });
+
+  test('a pre-publication policy can inspect the complete plan and refuse deletions', async () => {
+    writeFileSync(join(left, 'note.md'), 'keep');
+    await syncVaults(left, right);
+    unlinkSync(join(left, 'note.md'));
+    await expect(syncVaults(left, right, { beforeApply: result => {
+      expect(result.deleted).toBe(1);
+      throw new Error('Deletion not approved');
+    } })).rejects.toMatchObject({ code: 'VAULT_UNAVAILABLE' });
+    expect(text(right, 'note.md')).toBe('keep');
+  });
+
   test('edit/delete conflicts retain edited content and record deletion intent on both sides', async () => {
     writeFileSync(join(left, 'note.md'), 'base');
     await syncVaults(left, right);
