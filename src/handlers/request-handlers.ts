@@ -320,11 +320,14 @@ export class RequestHandlers {
         switch (args.action) {
           case 'create_entities': {
             const entities = await this.memoryManager.createEntities(args.entities);
+            const failures = this.memoryManager.getLastCreateFailures();
             const failedEntities = args.entities.length - entities.length;
             return {
               success: true, data: entities,
+              ...(failures.length > 0 ? { errors: failures } : {}),
               message: failedEntities > 0
-                ? `Created ${entities.length}/${args.entities.length} entities (${failedEntities} failed)`
+                ? `Created ${entities.length}/${args.entities.length} entities (${failedEntities} failed): ` +
+                  failures.map((f) => `${f.name} — ${f.reason}`).join('; ')
                 : `Created ${entities.length} entities`
             };
           }
