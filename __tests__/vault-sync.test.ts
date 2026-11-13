@@ -225,7 +225,7 @@ describe('Conflict-aware vault transport', () => {
 
   test('executes the serialized SSH peer against an isolated fake SSH transport', async () => {
     const diagnostic = join(root, 'ssh-error.txt');
-    const sshBinary = fakeSsh(`const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(${JSON.stringify(process.execPath)},['--input-type=module','-'],{stdio:['pipe','pipe','pipe']});process.stdin.pipe(child.stdin);child.stdout.on('data',data=>process.stdout.write(data));child.stderr.on('data',data=>fs.appendFileSync(${JSON.stringify(diagnostic)},data));child.on('exit',code=>process.exitCode=code);`);
+    const sshBinary = fakeSsh(`const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(${JSON.stringify(process.execPath)},['--input-type=module','-'],{stdio:['pipe','pipe','pipe']});let stdout='';process.stdin.pipe(child.stdin);child.stdout.on('data',data=>{stdout+=data;process.stdout.write(data);});child.stderr.on('data',data=>fs.appendFileSync(${JSON.stringify(diagnostic)},data));child.on('close',code=>{fs.appendFileSync(${JSON.stringify(diagnostic)},'exit='+code+' stdout='+stdout+'\\n');process.exitCode=code;});`);
     writeFileSync(join(left, "quoted ' note.md"), 'local');
     try {
       expect((await syncVaults(left, right, { remote: 'test@fixture', sshBinary })).copied).toBe(1);
