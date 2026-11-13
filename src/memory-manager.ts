@@ -29,6 +29,8 @@ export class MemoryManager {
   private memoryDbName: string = 'memory';
   private targetRoot: string;
   private centralDbPath: string;
+  /** Per-entity failures from the most recent createEntities call. */
+  private lastCreateFailures: Array<{ name: string; reason: string }> = [];
   private obsidianMirror!: ObsidianVaultMirror;
   private vaultWatcher: NodeJS.Timeout | null = null;
   private vaultNotes = new Map<string, { hash: string; name: string; version: string }>();
@@ -39,9 +41,14 @@ export class MemoryManager {
     this.sqliteManager = sqliteManager;
     this.targetRoot = targetRoot ?? process.cwd();
     const configured = process.env.GUARDIAN_CENTRAL_DB;
-    this.centralDbPath = (configured && isAbsolute(configured))
+    let centralPath = (configured && isAbsolute(configured))
       ? resolve(configured)
       : path.join(homedir(), 'memory', 'memory.db');
+    // Windows guard: never let a C:\Windows\System32 cwd capture the central DB.
+    if (centralPath.toLowerCase().includes('windows\\system32')) {
+      centralPath = path.join(homedir(), 'memory', 'memory.db');
+    }
+    this.centralDbPath = centralPath;
     this.obsidianMirror = new ObsidianVaultMirror();
     if (process.env.NODE_ENV !== 'test') {
       (async () => {
@@ -786,6 +793,7 @@ export class MemoryManager {
   async createEntities(entities: Array<{ name: string; entityType: string; observations: string[]; provenance?: Array<ObservationProvenance | undefined> }>): Promise<Entity[]> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const results: Entity[] = [];
+    this.lastCreateFailures = [];
     // single transaction for batch — avoids N fsyncs
     await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN TRANSACTION');
     try {
@@ -794,6 +802,10 @@ export class MemoryManager {
           const created = await this.createEntity(entity.name, entity.entityType, entity.observations, entity.provenance);
           results.push(created);
         } catch (error) {
+          this.lastCreateFailures.push({
+            name: entity.name,
+            reason: error instanceof Error ? error.message : String(error)
+          });
           console.error(`Failed to create entity ${entity.name}:`, error);
         }
       }
@@ -805,6 +817,11 @@ export class MemoryManager {
 
     if (results.length > 0) await this.syncToCentralSafe();
     return results;
+  }
+
+  /** Failure reasons from the most recent createEntities call. */
+  getLastCreateFailures(): Array<{ name: string; reason: string }> {
+    return this.lastCreateFailures;
   }
 
   async createRelation(from: string, to: string, relationType: string): Promise<Relation> {
