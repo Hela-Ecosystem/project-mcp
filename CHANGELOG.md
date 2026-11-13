@@ -2,12 +2,14 @@
 
 All notable changes to Project Guardian MCP.
 
-## [3.0.0] - 2026-10-31
+## [3.0.1] - 2026-11-13
 
-### Changed
-- **Version reset to 3.0.0** — per-server version metadata baseline reset (Phase 7). All `package.json`, MCP `ServerInfo.version`, and HTTP metadata now report `3.0.0`. This is a metadata/interface baseline reset; for `hela-plastid` it is not an upgrade from the previous `4.2.0` advert.
+### Fixed
+- Ported production and test runners away from Unix-only commands and added the Windows guard.
+- Preserved entity failure details and canonical vault relation ordering.
 
-## [Unreleased]
+### Security
+- Declared the distributed server under GPL-3.0-or-later.
 
 ### Memory safety and correctness (2026-11-06)
 - Added baseline-based two-way vault sync with SSH support, conflict/recovery archives, serialized locks, and stale-snapshot checks. Destructive `rsync --delete` mirror hooks are rejected.
@@ -27,6 +29,11 @@ All notable changes to Project Guardian MCP.
 - **Workspace path guard** — `import_data`/`export_data` reject absolute and traversal paths by default; opt out with `HELA_GENOME_ALLOW_EXTERNAL_PATHS=true`.
 - **Identifier validation** — table, condition, update, and order column names are validated before interpolation into SQL.
 - **Raw SQL write guard** — CTE writes and write-capable `PRAGMA` statements are rejected unless `HELA_GENOME_ALLOW_SQL_WRITE=true`; read-only PRAGMAs remain allowed.
+
+## [3.0.0] - 2026-10-31
+
+### Changed
+- **Version reset to 3.0.0** — per-server version metadata baseline reset (Phase 7). All `package.json`, MCP `ServerInfo.version`, and HTTP metadata now report `3.0.0`. This is a metadata/interface baseline reset; for `hela-plastid` it is not an upgrade from the previous `4.2.0` advert.
 
 ## [2.0.0-beta-3] - 2026-10-14
 
