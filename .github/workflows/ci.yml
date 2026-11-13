@@ -24,4 +24,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      - run: npm run test:ci
+      - run: node scripts/run-tests.mjs --coverage --runInBand
