@@ -282,7 +282,8 @@ function sshCommand(binary: string, remote: string, directory: string, command: 
   const script = `(${vaultCommand.toString()})(${JSON.stringify(directory)},${JSON.stringify(command)})` +
     `.then(result=>process.stdout.write(JSON.stringify({ok:true,result})))` +
     `.catch(error=>{const code=/^[A-Z_]+$/.test(error.message)?error.message:'VAULT_UNAVAILABLE';` +
-    `process.stdout.write(JSON.stringify({ok:false,code}));process.exitCode=1;});`;
+    `const detail=process.env.HELA_VAULT_DEBUG==='1'&&error instanceof Error?error.message:undefined;` +
+    `process.stdout.write(JSON.stringify({ok:false,code,...(detail?{detail}: {})}));process.exitCode=1;});`;
   if (Buffer.byteLength(script) > command.maxBytes) throw new VaultSyncError('LIMIT_EXCEEDED');
   return new Promise((resolveResult, reject) => {
     const child = spawn(binary, ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
@@ -311,6 +312,8 @@ function sshCommand(binary: string, remote: string, directory: string, command: 
         const response = JSON.parse(output);
         if (code !== 0 || response.ok !== true) {
           const allowed = errorCode(new Error(response.code));
+          if (response.ok === false && process.env.HELA_VAULT_DEBUG === '1' && typeof response.detail === 'string')
+            return reject(new VaultSyncError(`${allowed}: ${response.detail}`));
           return reject(new VaultSyncError(response.ok === false ? allowed : 'SSH_FAILED'));
         }
         resolveResult(response.result);
