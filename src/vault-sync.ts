@@ -28,6 +28,8 @@ type Command = {
 
 export interface VaultSyncOptions {
   remote?: string;
+  /** Override the SSH executable for controlled environments and tests. */
+  sshBinary?: string;
   timeoutMs?: number;
   maxBytes?: number;
   /** Runs under both locks, after snapshots and before writes. */
@@ -276,14 +278,14 @@ function errorCode(error: unknown): string {
     ? message : 'VAULT_UNAVAILABLE';
 }
 
-function sshCommand(remote: string, directory: string, command: Command, timeoutMs: number): Promise<unknown> {
+function sshCommand(binary: string, remote: string, directory: string, command: Command, timeoutMs: number): Promise<unknown> {
   const script = `(${vaultCommand.toString()})(${JSON.stringify(directory)},${JSON.stringify(command)})` +
     `.then(result=>process.stdout.write(JSON.stringify({ok:true,result})))` +
     `.catch(error=>{const code=/^[A-Z_]+$/.test(error.message)?error.message:'VAULT_UNAVAILABLE';` +
     `process.stdout.write(JSON.stringify({ok:false,code}));process.exitCode=1;});`;
   if (Buffer.byteLength(script) > command.maxBytes) throw new VaultSyncError('LIMIT_EXCEEDED');
   return new Promise((resolveResult, reject) => {
-    const child = spawn('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+    const child = spawn(binary, ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
       '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', '--', remote,
       'node --input-type=module -'], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
     let output = '';
@@ -329,6 +331,7 @@ export async function syncVaults(localDir: string, peerDir: string, options: Vau
   if (![localDir, peerDir].every(value => typeof value === 'string' && value.length > 0 && !value.includes('\0')) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120000 ||
       !Number.isInteger(maxBytes) || maxBytes < 16384 || maxBytes > 64 * 1024 * 1024 ||
+      (options.sshBinary !== undefined && (typeof options.sshBinary !== 'string' || options.sshBinary.length === 0 || options.sshBinary.includes('\0'))) ||
       (options.resolveConflict !== undefined && typeof options.resolveConflict !== 'function') ||
       (options.remote !== undefined && !/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(options.remote)))
     throw new VaultSyncError('INVALID_ARGUMENT');
@@ -340,7 +343,7 @@ export async function syncVaults(localDir: string, peerDir: string, options: Vau
   const common = { token, maxBytes };
   const runLocal = (command: Command): Promise<unknown> => vaultCommand(local, command);
   const runPeer = (command: Command): Promise<unknown> => options.remote
-    ? sshCommand(options.remote, peer, command, timeoutMs) : vaultCommand(peer, command);
+    ? sshCommand(options.sshBinary ?? 'ssh', options.remote, peer, command, timeoutMs) : vaultCommand(peer, command);
   let localOpened = false;
   let peerAttempted = false;
   let failure: unknown;

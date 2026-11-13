@@ -33,11 +33,13 @@ describe('Conflict-aware vault transport', () => {
       .map(file => readFileSync(join(directory, group, file), 'utf8')));
   }
 
-  function fakeSsh(body: string): void {
+  function fakeSsh(body: string): string {
     const bin = join(root, 'bin');
     mkdirSync(bin);
-    writeFileSync(join(bin, 'ssh'), `#!${process.execPath}\n${body}`, { mode: 0o700 });
+    const executable = join(bin, 'ssh');
+    writeFileSync(executable, `#!${process.execPath}\n${body}`, { mode: 0o700 });
     process.env.PATH = `${bin}:${originalPath}`;
+    return executable;
   }
 
   test('first sync unions independent notes and attachments without copying hidden directories', async () => {
@@ -223,10 +225,10 @@ describe('Conflict-aware vault transport', () => {
 
   test('executes the serialized SSH peer against an isolated fake SSH transport', async () => {
     const diagnostic = join(root, 'ssh-error.txt');
-    fakeSsh(`const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(${JSON.stringify(process.execPath)},['--input-type=module','-'],{stdio:['pipe','pipe','pipe']});process.stdin.pipe(child.stdin);child.stdout.on('data',data=>process.stdout.write(data));child.stderr.on('data',data=>fs.appendFileSync(${JSON.stringify(diagnostic)},data));child.on('exit',code=>process.exitCode=code);`);
+    const sshBinary = fakeSsh(`const {spawn}=require('node:child_process');const fs=require('node:fs');const child=spawn(${JSON.stringify(process.execPath)},['--input-type=module','-'],{stdio:['pipe','pipe','pipe']});process.stdin.pipe(child.stdin);child.stdout.on('data',data=>process.stdout.write(data));child.stderr.on('data',data=>fs.appendFileSync(${JSON.stringify(diagnostic)},data));child.on('exit',code=>process.exitCode=code);`);
     writeFileSync(join(left, "quoted ' note.md"), 'local');
     try {
-      expect((await syncVaults(left, right, { remote: 'test@fixture' })).copied).toBe(1);
+      expect((await syncVaults(left, right, { remote: 'test@fixture', sshBinary })).copied).toBe(1);
     } catch (error) {
       let details = '';
       try { details = readFileSync(diagnostic, 'utf8'); } catch {}
@@ -234,14 +236,14 @@ describe('Conflict-aware vault transport', () => {
     }
     expect(text(right, "quoted ' note.md")).toBe('local');
     writeFileSync(join(right, 'remote.md'), 'remote');
-    expect((await syncVaults(left, right, { remote: 'test@fixture' })).copied).toBe(1);
+    expect((await syncVaults(left, right, { remote: 'test@fixture', sshBinary })).copied).toBe(1);
     expect(text(left, 'remote.md')).toBe('remote');
   });
 
   test('SSH failure cannot be mistaken for an empty peer vault', async () => {
-    fakeSsh('process.stdin.resume();process.stdin.on("end",()=>process.exit(255));');
+    const sshBinary = fakeSsh('process.stdin.resume();process.stdin.on("end",()=>process.exit(255));');
     writeFileSync(join(left, 'note.md'), 'untouched');
-    await expect(syncVaults(left, right, { remote: 'test@fixture' })).rejects.toMatchObject({ code: 'SSH_FAILED' });
+    await expect(syncVaults(left, right, { remote: 'test@fixture', sshBinary })).rejects.toMatchObject({ code: 'SSH_FAILED' });
     expect(text(left, 'note.md')).toBe('untouched');
   });
 });
