@@ -18,6 +18,7 @@ import { resolve, isAbsolute } from 'path';
 // Modular imports
 import { allTools } from './tools/tool-registry.js';
 import { projectGuardianResources } from './resources/resource-registry.js';
+import { MCP_SERVER_VERSION } from './version.js';
 import { ResourceHandlers } from './resources/resource-registry.js';
 import { projectGuardianPrompts } from './prompts/prompt-registry.js';
 import { PromptHandlers } from './prompts/prompt-registry.js';
@@ -94,7 +95,7 @@ export class DatabaseMCPServer {
     const server = new Server(
       {
         name: 'project-guardian-mcp',
-        version: '3.0.1',
+        version: MCP_SERVER_VERSION,
       },
       {
         capabilities: {

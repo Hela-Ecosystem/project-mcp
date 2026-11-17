@@ -2,6 +2,14 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.2] - 2026-11-18
+
+### Fixed
+- The advertised MCP server version now comes from one `MCP_SERVER_VERSION` constant used by ServerInfo, `/healthz`, `/discovery`, and `server/discover`, so a `package.json` bump can no longer leave the server reporting an old number.
+
+### Tests
+- Added `__tests__/version.test.ts` asserting the constant equals `package.json.version`.
+
 ## [3.0.1] - 2026-11-13
 
 ### Fixed
