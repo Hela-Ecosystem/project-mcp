@@ -159,26 +159,42 @@ function main() {
   };
 
   if (options.sheet) {
+    // One row per note, not one per archived pair: a note with 19 conflicts is still one
+    // decision. The representative row uses the most recent pair for variant detail.
+    const pending = [
+      ...needsReview.map((item) => ({ manifest: { path: item.path }, variants: [], id: item.path, mtime: 0 })),
+      ...buckets['body-divergent'].map((entry) => ({
+        manifest: entry.manifest, variants: entry.variants, id: entry.id,
+        mtime: Math.max(...entry.variants.map((variant) => variant.mtime)),
+      })),
+    ];
+    const byPath = new Map();
+    for (const item of pending) {
+      const key = item.manifest.path ?? item.id;
+      const previous = byPath.get(key);
+      if (!previous || item.mtime > previous.mtime) byPath.set(key, { ...item, count: (previous?.count ?? 0) + 1 });
+      else previous.count += 1;
+    }
+    const row = (item) => {
+      const variants = item.variants.length
+        ? item.variants.map((variant) => `${variant.body.length}B${Number.isNaN(variant.updated) ? '' : ' · ' + new Date(variant.updated).toISOString().slice(0, 10)}`).join(' / ')
+        : 'note changed after the conflict';
+      return `| \`${item.manifest.path ?? item.id}\` | ${item.count} | ${variants} |  |`;
+    };
     const lines = [
       '# Vault conflict review sheet',
       '',
       `Generated ${new Date().toISOString()} from \`${path.join(options.vault, '.hela-sync', 'conflicts')}\`.`,
       '',
-      'Bodies differ, so nothing here is auto-picked. Fill the decision column and apply it deliberately.',
+      'One row per note. Bodies differ, or the note moved on after the conflict, so nothing here is auto-picked.',
+      'Fill the decision column (local/remote/merge/keep-both) and apply it deliberately.',
       '',
-      '| Note | Conflicts | Variants (bytes · updated) | Decision (local/remote/merge/keep-both) |',
+      '| Note | Conflicts | Variants (bytes · updated) | Decision |',
       '| --- | --- | --- | --- |',
-      ...needsReview.map((item) => ({ manifest: { path: item.path }, variants: [] })),
-      ...buckets['body-divergent']
-        .sort((a, b) => (repeated.get(b.manifest.path) ?? 0) - (repeated.get(a.manifest.path) ?? 0))
-        .map((entry) => {
-          const variants = entry.variants
-            .map((variant) => `${variant.body.length}B${Number.isNaN(variant.updated) ? '' : ' · ' + new Date(variant.updated).toISOString().slice(0, 10)}`)
-            .join(' / ');
-          return `| \`${entry.manifest.path ?? entry.id}\` | ${repeated.get(entry.manifest.path) ?? 1} | ${variants} |  |`;
-        }),
+      ...[...byPath.values()].sort((a, b) => b.count - a.count).map(row),
     ];
     fs.writeFileSync(options.sheet, lines.join('\n') + '\n');
+    summary.sheetRows = byPath.size;
   }
 
   if (options.json) console.log(JSON.stringify(summary, null, 2));
@@ -190,7 +206,7 @@ function main() {
     if (summary.bodyChangedSurprises > 0) {
       console.log(`WARNING: ${summary.bodyChangedSurprises} frontmatter-only conflicts had a body that did not match the current note; inspect resolved/ before trusting them`);
     }
-    if (options.sheet) console.log(`review sheet: ${options.sheet} (${summary.bodyDivergent + summary.needsReview} rows)`);
+    if (options.sheet) console.log(`review sheet: ${options.sheet} (${summary.sheetRows} notes)`);
     if (!options.apply) console.log('dry run only; pass --apply to collapse the frontmatter-only bucket');
   }
 }
