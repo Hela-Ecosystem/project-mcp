@@ -12,6 +12,11 @@ import {
   ProvenanceRowSchema,
 } from './observation-provenance.js';
 import { embedText, toVecString } from './vector-manager.js';
+import {
+  ensureSourceFeedbackSchema,
+  recordSourceFeedback,
+  getSourcePriors,
+} from './source-feedback.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { exec, execFile, spawn } from 'child_process';
@@ -140,6 +145,8 @@ export class MemoryManager {
     
     await this.ensureFtsSchema(this.centralDbPath);
     await this.ensureMissionsSchema(this.centralDbPath);
+    // Search-source feedback is a cross-project signal, so it lives centrally.
+    await ensureSourceFeedbackSchema(this.sqliteManager, this.centralDbPath);
     try {
       await this.sqliteManager.executeSql(this.centralDbPath, `CREATE VIRTUAL TABLE IF NOT EXISTS vec_entities USING vec0(embedding float[${384}])`);
     } catch (e) { void e; }
@@ -216,6 +223,7 @@ export class MemoryManager {
     if (!vecRes.success) console.warn('[vec] create table failed for', this.memoryDbName, vecRes.error);
     // P1-C2: provenance sidecar for externally-sourced observation facts
     await ensureObservationProvenanceSchema(this.sqliteManager, this.memoryDbName);
+    await ensureSourceFeedbackSchema(this.sqliteManager, this.memoryDbName);
     this.projectSchemaReady = true;
   }
 
@@ -461,6 +469,19 @@ export class MemoryManager {
 
   getCentralDatabaseId(): string {
     return this.centralDbPath;
+  }
+
+  /**
+   * Record one search-source decision. Written to the central database so the
+   * priors Enzyme reads are shared by every project on this machine.
+   */
+  async recordSearchFeedback(input: unknown): Promise<unknown> {
+    return recordSourceFeedback(this.sqliteManager, this.centralDbPath, input);
+  }
+
+  /** Per-class multipliers, sample counts, and the sources still exploring. */
+  async getSearchPriors(input: unknown): Promise<unknown> {
+    return getSourcePriors(this.sqliteManager, this.centralDbPath, input);
   }
 
   static buildBackupName(date: Date): string {

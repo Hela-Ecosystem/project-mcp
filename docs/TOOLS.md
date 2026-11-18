@@ -1,6 +1,6 @@
 # HeLa Genome: canonical tools
 
-Server version **3.0.4**. Generated from the ecosystem schema catalog; regenerate with `npm run docs:generate -- --servers` in the ecosystem checkout.
+Server version **3.0.6**. Generated from the ecosystem schema catalog; regenerate with `npm run docs:generate -- --servers` in the ecosystem checkout.
 
 Only names advertised by `tools/list` are listed here. Older aliases in migration examples are not additional tools. Runtime namespace prefixes are optional and do not change these server-local names.
 
@@ -99,6 +99,14 @@ Read the entire project knowledge graph
 ## `read_graph_stream`
 
 Stream the knowledge graph with cursor pagination (500/page, updated_at DESC). Returns entities, relations, nextCursor.
+
+## `search_feedback`
+
+Record which search source produced the result a caller actually used, so hela-enzyme can learn its per-source ranking priors instead of relying on static constants. Call once per source that returned results: used=true for the source whose result you used, used=false for sources you saw and passed over.
+
+## `search_priors`
+
+Return the learned per-class search-source multipliers derived from search_feedback, with sample counts and which sources are still exploring (carrying the exploration bonus so an unsampled source can be picked again).
 
 ## `search_nodes`
 

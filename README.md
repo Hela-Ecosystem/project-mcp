@@ -1,7 +1,7 @@
 # Project Guardian MCP
 
 <!-- hela:version:start -->
-**MCP server:** `hela-genome` · **Version:** `3.0.4` · **Canonical tools:** 29. [Current tool reference](docs/TOOLS.md).
+**MCP server:** `hela-genome` · **Version:** `3.0.6` · **Canonical tools:** 31. [Current tool reference](docs/TOOLS.md).
 <!-- hela:version:end -->
 
 
@@ -78,7 +78,7 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - **Core CRUD**: Essential database operations (query, insert, update, delete)
 - **SQL Execution**: Direct SQL query execution
 - **Data Transfer**: Import/export CSV and JSON files
-- **29 Canonical Tools + Legacy Aliases**: Seven database tools, nine memory/guidance tools (`initialize_memory`, `memory_edit`, `read_graph`, `read_graph_stream`, `search_nodes`, `open_node`, `get_file_context`, `get_timeline`, `get_project_guidance`), three fleet mission tools (`create_mission`, `list_missions`, `update_mission`), and ten runtime tools (including `obsidian_vault`). The view-only Web UI dashboard has been removed in favor of the optional Obsidian vault mirror. Legacy names such as `create_entity` remain as deprecated aliases that normalize to canonical actions.
+- **31 Canonical Tools + Legacy Aliases**: Seven database tools, nine memory/guidance tools (`initialize_memory`, `memory_edit`, `read_graph`, `read_graph_stream`, `search_nodes`, `open_node`, `get_file_context`, `get_timeline`, `get_project_guidance`), three fleet mission tools (`create_mission`, `list_missions`, `update_mission`), two search-feedback tools (`search_feedback`, `search_priors`), and ten runtime tools (including `obsidian_vault`). The view-only Web UI dashboard has been removed in favor of the optional Obsidian vault mirror. Legacy names such as `create_entity` remain as deprecated aliases that normalize to canonical actions.
 
 ### Runtime Companion Integration
 

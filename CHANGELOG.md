@@ -2,6 +2,15 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.6] - 2026-11-19
+
+### Added
+- Search-source feedback loop (Genome side). `source_feedback` table in the central database (`id`, `recorded_at`, `query_class`, `source`, `used`, `query`, `note`, indexed on `(query_class, source)`) records which search source produced the result a caller actually used. Two new tools: `search_feedback` records one decision, `search_priors` returns the derived per-class multipliers with sample counts and the sources still exploring. Queries and notes are truncated to 512 characters, never stored whole.
+- Prior derivation rule with a collapse guard: once a `(query_class, source)` cell has at least 5 samples, a Beta-smoothed success rate `p = (used + 1) / (n + 2)` maps to `clamp(1 + 1.0 * (p - 0.5), 0.5, 1.5)`; below that the static prior stands. A source with no samples in a class that already has 5, or whose newest sample is over 30 days old, is floored at 1.0 and lifted by a 0.15 exploration bonus, so a source that stopped being sampled can always be picked again and recover. Eleven tests, three of which fail if the guard is removed.
+
+### Changed
+- `SQLiteManager.SCHEMA_VERSION` bumped to 2 for the `source_feedback` migration.
+
 ## [3.0.5] - 2026-11-19
 
 ### Added

@@ -93,6 +93,10 @@ export class SQLiteManager {
       }
     }
     const dbPath = this.getDatabasePath(name);
+    // A configured database path can live outside the managed directory (the central
+    // genome store is chosen by GUARDIAN_CENTRAL_DB). Create its parent instead of
+    // failing later with SQLITE_CANTOPEN on the first query.
+    if (!dbPath.startsWith(':memory:')) mkdirSync(dirname(dbPath), { recursive: true });
     const db = new sqlite3.Database(dbPath);
     this.connections.set(name, db);
     // Performance: WAL + NORMAL + 64MB cache + 64MB journal cap + memory temp
@@ -877,7 +881,7 @@ export class SQLiteManager {
   }
 
   /** Highest schema revision this build understands. Bump it when a migration lands. */
-  static readonly SCHEMA_VERSION = 1;
+  static readonly SCHEMA_VERSION = 2;
 
   /**
    * Record and verify the database schema revision.

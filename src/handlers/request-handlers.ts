@@ -17,6 +17,7 @@ import {
   SetProjectRootSchema, SetupPreCommitSchema, SyncCentralMemorySchema,
   HarnessSessionsSchema, ListHarnessStoresSchema, SyncHarnessSessionsSchema,
 } from '../types.js';
+import { SearchFeedbackSchema, SearchPriorsSchema } from '../source-feedback.js';
 import { normalizeToolCall } from '../tool-aliases.js';
 import { locateStores } from '../session-bridge/stores.js';
 import { syncHarnessSessions } from '../session-bridge/sync.js';
@@ -98,6 +99,8 @@ const toolSchemas = {
   sync_central_memory: SyncCentralMemorySchema,
   get_project_guidance: z.object({ guidance_name: z.string().min(1), arguments: z.record(z.string(), z.string()).optional() }),
   obsidian_vault: z.object({ action: z.enum(['status', 'sync', 'rebuild', 'backfill', 'sync_central', 'sync_from_central', 'dedup']).default('status') }),
+  search_feedback: SearchFeedbackSchema,
+  search_priors: SearchPriorsSchema,
 };
 
 const runtimeToolNames = new Set([
@@ -144,6 +147,14 @@ export class RequestHandlers {
           },
           message: `Successfully loaded guidance for ${guidance.guidance_name}`
         };
+      }
+
+      // Search-source feedback needs only the database, not the runtime companions.
+      if (name === 'search_feedback') {
+        return { success: true, data: await this.memoryManager.recordSearchFeedback(toolSchemas.search_feedback.parse(args)) };
+      }
+      if (name === 'search_priors') {
+        return { success: true, data: await this.memoryManager.getSearchPriors(toolSchemas.search_priors.parse(args ?? {})) };
       }
 
       if (runtimeToolNames.has(name)) {

@@ -32,6 +32,26 @@ export const runtimeTools: Tool[] = [
     }, ['action']),
   },
   {
+    name: 'search_feedback',
+    description:
+      'Record which search source produced the result a caller actually used, so hela-enzyme can learn its per-source ranking priors instead of relying on static constants. Call once per source that returned results: used=true for the source whose result you used, used=false for sources you saw and passed over.',
+    inputSchema: object({
+      query_class: { type: 'string', enum: ['news', 'academic', 'technical', 'definition', 'entity', 'general'], description: 'Query class the search was routed as' },
+      source: { type: 'string', enum: ['google', 'wikipedia', 'news_monitor', 'academic_search'], description: 'Search back-end this decision is about' },
+      used: { type: 'boolean', description: 'true when a result from this source was used, false when it was seen and passed over' },
+      query: { type: 'string', maxLength: 4096, description: 'Optional query text; stored truncated to 512 characters' },
+      note: { type: 'string', maxLength: 4096, description: 'Optional short reason; stored truncated to 512 characters' },
+    }, ['query_class', 'source', 'used']),
+  },
+  {
+    name: 'search_priors',
+    description:
+      'Return the learned per-class search-source multipliers derived from search_feedback, with sample counts and which sources are still exploring (carrying the exploration bonus so an unsampled source can be picked again).',
+    inputSchema: object({
+      query_class: { type: 'string', enum: ['news', 'academic', 'technical', 'definition', 'entity', 'general'], description: 'Limit the answer to one class; omit for all' },
+    }),
+  },
+  {
     name: 'cache',
     description:
       'Read or mutate the optional Redis companion cache. Select action: get, set, delete, or scan. Keys must use the mema:<category>:<name> namespace.',
