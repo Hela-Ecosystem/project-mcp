@@ -1,7 +1,7 @@
 # Project Guardian MCP
 
 <!-- hela:version:start -->
-**MCP server:** `hela-genome` · **Version:** `3.0.3` · **Canonical tools:** 29. [Current tool reference](docs/TOOLS.md).
+**MCP server:** `hela-genome` · **Version:** `3.0.4` · **Canonical tools:** 29. [Current tool reference](docs/TOOLS.md).
 <!-- hela:version:end -->
 
 
