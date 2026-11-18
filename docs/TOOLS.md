@@ -104,13 +104,13 @@ Stream the knowledge graph with cursor pagination (500/page, updated_at DESC). R
 
 Record which search source produced the result a caller actually used, so hela-enzyme can learn its per-source ranking priors instead of relying on static constants. Call once per source that returned results: used=true for the source whose result you used, used=false for sources you saw and passed over.
 
-## `search_priors`
-
-Return the learned per-class search-source multipliers derived from search_feedback, with sample counts and which sources are still exploring (carrying the exploration bonus so an unsampled source can be picked again).
-
 ## `search_nodes`
 
 Search project entities and relations with hybrid RAG and progressive disclosure
+
+## `search_priors`
+
+Return the learned per-class search-source multipliers derived from search_feedback, with sample counts and which sources are still exploring (carrying the exploration bonus so an unsampled source can be picked again).
 
 ## `security_scan`
 
