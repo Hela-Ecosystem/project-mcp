@@ -244,6 +244,7 @@ export class MemoryManager {
     }
 
     await this.ensureCentralSchema();
+    await this.sqliteManager.ensureSchemaVersion(this.centralDbPath);
     // P1-C2: central sidecar so synced observations keep their provenance refs
     await ensureObservationProvenanceSchema(this.sqliteManager, this.centralDbPath);
 
@@ -305,7 +306,10 @@ export class MemoryManager {
   }
 
   async syncFromCentral(): Promise<{ entities: number; relations: number }> {
-    if (!this.projectSchemaReady) await this.ensureProjectSchema();
+    if (!this.projectSchemaReady) {
+      await this.ensureProjectSchema();
+      await this.sqliteManager.ensureSchemaVersion(this.memoryDbName);
+    }
     await this.ensureCentralSchema();
     let eCount = 0, rCount = 0;
     try {

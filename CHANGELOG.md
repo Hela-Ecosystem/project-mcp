@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.4] - 2026-11-19
+
+### Added
+- Schema revision tracking: both databases are stamped with `PRAGMA user_version` after their schema is created, a rerun is a no-op, and a file written by a newer build is refused instead of being partially understood. Covered by three tests.
+
 ## [3.0.3] - 2026-11-19
 
 ### Changed

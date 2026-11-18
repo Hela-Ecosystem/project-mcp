@@ -876,6 +876,32 @@ export class SQLiteManager {
     });
   }
 
+  /** Highest schema revision this build understands. Bump it when a migration lands. */
+  static readonly SCHEMA_VERSION = 1;
+
+  /**
+   * Record and verify the database schema revision.
+   *
+   * SQLite keeps this in `PRAGMA user_version`, which survives copies and backups.
+   * A file written by a newer build is refused instead of being silently opened and
+   * partially understood; an older (or fresh) file is stamped after this build has
+   * created its schema.
+   */
+  async ensureSchemaVersion(name: string): Promise<{ previous: number; current: number }> {
+    const db = await this.getConnection(name);
+    const row = await this.query<{ user_version: number }>(db, 'PRAGMA user_version');
+    const previous = Number(row.rows[0]?.user_version ?? 0);
+    if (previous > SQLiteManager.SCHEMA_VERSION) {
+      throw new Error(
+        `database ${name} was written by a newer schema (user_version ${previous} > ${SQLiteManager.SCHEMA_VERSION}); upgrade HeLa before using it`,
+      );
+    }
+    if (previous !== SQLiteManager.SCHEMA_VERSION) {
+      await this.runQuery(db, `PRAGMA user_version = ${SQLiteManager.SCHEMA_VERSION}`);
+    }
+    return { previous, current: SQLiteManager.SCHEMA_VERSION };
+  }
+
   async closeConnection(name: string): Promise<void> {
     const connection = this.connections.get(name);
     if (connection) {
