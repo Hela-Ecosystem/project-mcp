@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.3] - 2026-11-19
+
+### Changed
+- npm audit fix clears two moderate advisories; no API change.
+
 ## [3.0.2] - 2026-11-18
 
 ### Fixed
