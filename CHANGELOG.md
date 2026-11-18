@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.5] - 2026-11-19
+
+### Added
+- `npm run vault:conflicts`: audits the sync conflict archive and collapses the safely decidable cases. Bodies that differ only in frontmatter are archived (the note is not rewritten, so its newer timestamps survive); notes whose body moved on since the conflict, and every body-divergent conflict, are listed in a review sheet instead of guessed. Dry run by default; `--apply` archives, copying the previous note and the manifest into `.hela-sync/resolved/`.
+
 ## [3.0.4] - 2026-11-19
 
 ### Added
