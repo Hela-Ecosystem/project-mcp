@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.0.7] - 2026-11-22
+
+### Added
+- Genome drains the search-feedback spool Enzyme writes. `search_feedback` and `search_priors` now ingest `~/.local/state/hela/search-feedback.jsonl` before answering, so the implicit follow-up signals Enzyme observes become rows in `source_feedback` without giving Enzyme write access to the table. The file is claimed by rename, so two processes cannot import the same line twice; records that fail to insert are put back rather than lost. (`researcher-mcp#35`)
+
 ## [3.0.6] - 2026-11-19
 
 ### Added

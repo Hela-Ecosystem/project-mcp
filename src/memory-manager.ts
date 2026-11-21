@@ -1,3 +1,4 @@
+import { ingestFeedbackSpool } from './feedback-spool.js';
 import { SQLiteManager } from './sqlite-manager.js';
 import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
 import { DatabaseRow, DatabaseOperationResult, SqlExecutionData, memoryRowSchemas } from './types.js';
@@ -477,6 +478,17 @@ export class MemoryManager {
    */
   async recordSearchFeedback(input: unknown): Promise<unknown> {
     return recordSourceFeedback(this.sqliteManager, this.centralDbPath, input);
+  }
+
+  /**
+   * Drain feedback Enzyme observed and could not write itself. Idempotent and
+   * cheap when the spool is absent; called before priors are read or recorded.
+   */
+  async ingestSearchFeedbackSpool(spoolPath?: string): Promise<{ imported: number; skipped: number; failed: number }> {
+    return ingestFeedbackSpool(
+      (record) => recordSourceFeedback(this.sqliteManager, this.centralDbPath, record),
+      spoolPath,
+    );
   }
 
   /** Per-class multipliers, sample counts, and the sources still exploring. */

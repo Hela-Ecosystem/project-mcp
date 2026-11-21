@@ -151,9 +151,11 @@ export class RequestHandlers {
 
       // Search-source feedback needs only the database, not the runtime companions.
       if (name === 'search_feedback') {
+        await this.memoryManager.ingestSearchFeedbackSpool();
         return { success: true, data: await this.memoryManager.recordSearchFeedback(toolSchemas.search_feedback.parse(args)) };
       }
       if (name === 'search_priors') {
+        await this.memoryManager.ingestSearchFeedbackSpool();
         return { success: true, data: await this.memoryManager.getSearchPriors(toolSchemas.search_priors.parse(args ?? {})) };
       }
 
