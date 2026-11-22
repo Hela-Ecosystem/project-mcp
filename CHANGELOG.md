@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.1.1] - 2026-11-22
+
+### Fixed
+- Deletions survive the sync boundary. Entity tombstones are reconciled in both directions, central rows are removed (or blocked from being re-inserted by a trigger), and `sync_central_memory` reports how many entities/relations it deleted or skipped instead of silently re-adding them. `set_project_root` no longer imports another project into a fresh root. (`project-mcp#37`)
+
 ## [3.1.0] - 2026-11-22
 
 ### Fixed
