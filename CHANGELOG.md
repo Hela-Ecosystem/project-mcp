@@ -2,6 +2,21 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.2.0] - 2026-11-23
+
+### Changed
+- **Breaking:** `insert_data`, `update_data` and `import_data` now require `HELA_GENOME_ALLOW_DESTRUCTIVE=true`, the same gate `delete_data` and `setup_pre_commit` already had. An update that overwrites observations is as destructive as a delete, and the gate was only consistent for one of them. Read-only tools and append-only `memory_edit` stay open. (`project-mcp#40`)
+- `read_graph` is paged (default 500, max 1000) and returns `nextCursor`; `read_graph_stream` is unchanged, and the merged scope delegates to its keyset walk. The tool previously returned the whole graph, 1.3 MB in the report.
+- `analyze_git_changes` treats `since: "0"` (the new default) as uncommitted changes and falls back to the empty tree on a root commit, so a one-commit repository reports modified and untracked files.
+
+### Fixed
+- `security_scan` detects AWS access keys (`AKIA` plus 16 characters) and names each finding type (`aws_access_key`, `github_pat`, `key_value_secret`, …) from the shared redaction table.
+- `get_file_context` resolves absolute and parent-relative paths to the stored `file:<workspace>/...` form.
+- `bug-tracking` guidance files `bug:<slug>` with `entityType: "bug"`, so the bugs it creates appear in `get_session_context.openBugs`.
+- The pre-commit hook merges with `&&` (no delete after a failed merge), merges observations instead of discarding newer ones, moves merged databases to `.guardian-merged/`, and skips `.git`, `node_modules`, `vendor`, `venv`, `dist`, `build`, `target`, `backups`.
+- Empty `conditions` and empty updates are rejected explicitly instead of relying on a SQL syntax error.
+- CSV export prefixes cells starting with `=`, `+`, `-`, `@`, tab or CR with an apostrophe.
+
 ## [Unreleased]
 
 ### Fixed
