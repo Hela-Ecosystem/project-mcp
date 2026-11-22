@@ -235,6 +235,63 @@ describe('RequestHandlers', () => {
       expect(result).toHaveProperty('message', 'Created 1 entities');
     });
 
+    test('should hide a deleted project entity from open_node and search_nodes in the same process', async () => {
+      const name = 'probe:deletionsentinel';
+      const open = () => requestHandlers.handleToolCall('open_node', { names: [name] });
+      const search = () => requestHandlers.handleToolCall('search_nodes', { query: 'deletionsentinel' });
+      const create = (observation: string) => requestHandlers.handleToolCall('memory_edit', {
+        action: 'create_entities',
+        entities: [{ name, entityType: 'resource', observations: [observation] }]
+      });
+
+      await expect(create('Original content')).resolves.toHaveProperty('message', 'Created 1 entities');
+      // Automatic central sync is disabled during tests.
+      await expect(memoryManager.syncToCentral()).resolves.toHaveProperty('entities', 1);
+      await expect(open()).resolves.toMatchObject({ data: [expect.objectContaining({ name })] });
+      await expect(search()).resolves.toMatchObject({ data: { entities: [expect.objectContaining({ name })] } });
+
+      await expect(requestHandlers.handleToolCall('memory_edit', {
+        action: 'delete_entities', entityNames: [name]
+      })).resolves.toEqual({ success: true, message: 'Deleted 1 entities' });
+      const [opened, found] = await Promise.all([open(), search()]);
+      expect({ opened, found }).toMatchObject({
+        opened: { data: [] },
+        found: { data: { entities: [] } }
+      });
+      await expect(requestHandlers.handleToolCall('read_graph', { database: 'central' })).resolves.toMatchObject({
+        data: { entities: [expect.objectContaining({ name })] }
+      });
+      await expect(memoryManager.syncFromCentral({ restoreDeleted: false })).resolves.toHaveProperty('entities', 0);
+      await expect(open()).resolves.toMatchObject({ data: [] });
+
+      await expect(create('Recreated content')).resolves.toHaveProperty('message', 'Created 1 entities');
+      const recreated = expect.objectContaining({ name, observations: ['Recreated content'] });
+      await expect(open()).resolves.toMatchObject({ data: [recreated] });
+      await expect(search()).resolves.toMatchObject({ data: { entities: [recreated] } });
+    });
+
+    test('should count deleted rows and report each missing name', async () => {
+      const name = 'probe:deletecount';
+      const missing = ['probe:missingone', 'probe:missingtwo'];
+      const deleteNames = (entityNames: string[]) => requestHandlers.handleToolCall('memory_edit', {
+        action: 'delete_entities', entityNames
+      });
+      await expect(requestHandlers.handleToolCall('memory_edit', {
+        action: 'create_entities', entities: [{ name, entityType: 'resource', observations: [] }]
+      })).resolves.toHaveProperty('message', 'Created 1 entities');
+
+      await expect(deleteNames([missing[0], name, name, missing[1]])).resolves.toEqual({
+        success: true,
+        message: 'Deleted 1/4 entities (3 not found)',
+        errors: [missing[0], name, missing[1]].map(name => ({ name, reason: `Entity '${name}' does not exist` }))
+      });
+      await expect(deleteNames(missing)).resolves.toEqual({
+        success: true,
+        message: 'Deleted 0/2 entities (2 not found)',
+        errors: missing.map(name => ({ name, reason: `Entity '${name}' does not exist` }))
+      });
+    });
+
     test('should handle read_graph tool', async () => {
       const result = await requestHandlers.handleToolCall('read_graph', {});
 

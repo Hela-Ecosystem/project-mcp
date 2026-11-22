@@ -368,9 +368,18 @@ export class RequestHandlers {
             };
           }
 
-          case 'delete_entities':
-            await this.memoryManager.deleteEntities(args.entityNames);
-            return { success: true, message: `Deleted ${args.entityNames.length} entities` };
+          case 'delete_entities': {
+            const { deleted, missing } = await this.memoryManager.deleteEntities(args.entityNames);
+            return {
+              success: true,
+              ...(missing.length > 0 ? {
+                errors: missing.map(name => ({ name, reason: `Entity '${name}' does not exist` }))
+              } : {}),
+              message: missing.length > 0
+                ? `Deleted ${deleted}/${args.entityNames.length} entities (${missing.length} not found)`
+                : `Deleted ${deleted} entities`
+            };
+          }
 
           case 'delete_observations': {
             const delResults = await this.memoryManager.deleteObservations(args.deletions);
