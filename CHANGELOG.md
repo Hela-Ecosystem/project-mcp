@@ -2,6 +2,11 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.1.2] - 2026-11-22
+
+### Fixed
+- Mission lifecycle is guarded. Transitions follow `queued → claimed → in_progress → completed | failed`, any state can be cancelled, and `action: "requeue"` clears claim fields and returns a mission to `queued`. Acting on an active claim requires the claimant named, so one agent cannot complete another agent's mission, and claims carry a 30-minute lease that allows a crashed agent's mission to be reclaimed. Completion requires a non-null result; conflicting or inconsistent updates are rejected instead of stored. (`project-mcp#39`)
+
 ## [3.1.1] - 2026-11-22
 
 ### Fixed
