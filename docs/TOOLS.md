@@ -6,7 +6,7 @@ Only names advertised by `tools/list` are listed here. Older aliases in migratio
 
 ## `analyze_git_changes`
 
-Analyze bounded Git changes and untracked files in the current workspace
+Analyze bounded Git changes and untracked files in the current workspace. since defaults to "0": uncommitted changes against HEAD. Use "1" for the last commit, "N" for N commits ago, or a Git date
 
 ## `cache`
 
@@ -40,11 +40,11 @@ Invoke a project guidance framework to receive specialized instructions and chec
 
 ## `get_session_context`
 
-Summarize active tasks, open bugs, recent changes, and blockers from project memory. Set `scope` to `merged` to include central memory.
+Summarize active tasks, open bugs, recent changes, and blockers from project memory
 
 ## `get_timeline`
 
-Get a chronological feed of recent observations and project activity
+Get recent observations and project activity, newest first
 
 ## `harness_sessions`
 
@@ -94,7 +94,7 @@ Canonical memory-graph table query (use instead of hela-ribosome opencode_db). Q
 
 ## `read_graph`
 
-Read the entire project knowledge graph
+Read one bounded page of the project knowledge graph (default 500 entities). Follow nextCursor for more; use read_graph_stream for keyset streaming.
 
 ## `read_graph_stream`
 
@@ -120,7 +120,7 @@ Actions: `secrets`, `container`.
 
 ## `set_project_root`
 
-Switch the active memory database to the given absolute project path without importing or publishing memory.
+Switch the active memory database to the given absolute project path without importing or publishing memory
 
 ## `setup_pre_commit`
 
@@ -128,7 +128,7 @@ Create a .pre-commit-config.yaml in the active project root and install the Git 
 
 ## `sync_central_memory`
 
-Publish the active project graph to central memory, reconcile entity deletions in both stores, and report skipped entities and relations.
+Publish the active project graph to central memory, reconcile entity deletions in both stores, and report skipped entities and relations
 
 ## `update_data`
 
@@ -136,8 +136,6 @@ Update records in memory.db table
 
 ## `update_mission`
 
-Claim a queued mission with `claimedBy` and optional `status: "claimed"`. The lease lasts 30 minutes from `claimedAt`, including while the mission is in progress. Claiming an expired mission returns it to `claimed` and starts a fresh lease.
+Claim a queued mission or reclaim an expired claim with status "claimed" and claimedBy. Claims are exclusive and expire 30 minutes after claimedAt. The current claimant can move a live claim to in_progress, then completed or failed. Cancel from any state, naming the claimant for an active claim. Operators can use action "requeue" to reset a mission and clear its claim and outcome.
 
-With a live claim, supply the matching `claimedBy` to move from `claimed` to `in_progress`, then to `completed` or `failed`. Completion requires a non-null JSON `result`. Failure accepts an optional `result` and `error`.
-
-Use `status: "cancelled"` from any state and supply the matching `claimedBy` for an active claim. Operators can use `action: "requeue"` with the mission ID and optional database to clear the claim and outcome and return the mission to `queued`.
+Actions: `requeue`.
