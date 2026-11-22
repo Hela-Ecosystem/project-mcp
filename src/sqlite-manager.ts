@@ -4,6 +4,7 @@ import {
   lstatSync, realpathSync, mkdtempSync, rmSync, readSync, chmodSync, linkSync
 } from 'fs';
 import { join, isAbsolute, resolve, dirname, basename } from 'path';
+import { types as utilTypes } from 'node:util';
 import { 
   DatabaseInfo, 
   TableInfo, 
@@ -659,10 +660,15 @@ export class SQLiteManager {
     }
   }
 
-  async executeSql(database: string, query: string, parameters?: unknown[]): Promise<DatabaseOperationResult<SqlExecutionData>> {
+  async executeSql(database: string, query: string, parameters?: unknown[], options: { readOnly?: boolean } = {}): Promise<DatabaseOperationResult<SqlExecutionData>> {
+    let readOnlyDb: sqlite3.Database | undefined;
     try {
       const startTime = Date.now();
-      const db = await this.getConnection(database);
+      if (options.readOnly) {
+        readOnlyDb = await this.openReadOnlyDatabase(this.getDatabasePath(database));
+        readOnlyDb.configure('busyTimeout', 5000);
+      }
+      const db = readOnlyDb ?? await this.getConnection(database);
       
       const firstKeyword = query.trim().split(/\s+/, 1)[0]?.toUpperCase();
       const isRowReturning = ['SELECT', 'WITH', 'PRAGMA', 'EXPLAIN', 'VALUES'].includes(firstKeyword);
@@ -696,8 +702,10 @@ export class SQLiteManager {
       return {
         success: false,
         message: 'Failed to execute SQL query',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: utilTypes.isNativeError(error) ? error.message : 'Unknown error'
       };
+    } finally {
+      if (readOnlyDb) await this.closeDatabase(readOnlyDb);
     }
   }
 
@@ -816,7 +824,7 @@ export class SQLiteManager {
     });
   }
 
-  private async closeSnapshotConnection(db: sqlite3.Database): Promise<void> {
+  private async closeDatabase(db: sqlite3.Database): Promise<void> {
     await new Promise<void>((resolve, reject) => db.close(error => error ? reject(error) : resolve()));
   }
 
@@ -842,7 +850,7 @@ export class SQLiteManager {
           });
         });
       } finally {
-        await this.closeSnapshotConnection(source);
+        await this.closeDatabase(source);
       }
 
       this.assertSQLiteHeader(snapshotPath);
@@ -853,7 +861,7 @@ export class SQLiteManager {
           throw new Error('SQLite backup integrity validation failed');
         }
       } finally {
-        await this.closeSnapshotConnection(snapshot);
+        await this.closeDatabase(snapshot);
       }
       chmodSync(snapshotPath, 0o600);
       this.assertNewDatabaseDestination(destination);

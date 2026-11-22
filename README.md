@@ -68,7 +68,7 @@ A Model Context Protocol (MCP) server for persistent project memory, knowledge-g
 - **Read-only ingestion from 8 agent harnesses**: `opencode`, `kilocode`, `zed`, `delta`, `antigravity`, `cursor`, `vscode`, `codex`. Sources are opened read-only (SQLite `OPEN_READONLY`, capped JSONL scans) — the bridge never writes to harness stores and never touches harness processes.
 - **What's harvested**: session titles, summaries/previews, timestamps, project directories, models, message/step counts. Full transcripts and binaries are never ingested.
 - **Secret redaction first**: API keys, tokens, bearer credentials, private keys, and password assignments are replaced with `[REDACTED]` before anything reaches the graph.
-- **Incremental + idempotent**: per-session watermarks in a `harness_sync` table — re-runs only pick up new or updated sessions; `dryRun` previews without writing.
+- **Incremental + idempotent**: per-session watermarks in `harness_sync` let reruns pick up new or updated sessions. `dryRun` reads those same watermarks and previews the create, update, and skip counts without writing. Invalid source timestamps are reported with the session ID and field.
 - **Absent stores are honest**: harnesses with no local store on the machine (e.g. Cursor/VS Code when not installed) report `found: false` instead of failing. Store paths are overridable via `HARNESS_<ID>_PATH`.
 
 ### Streamlined Database Operations
@@ -342,10 +342,10 @@ Pre-flight check before editing or reading a file. Retrieves prior modification 
 - `filePath` (required): Workspace-relative or absolute file path (e.g. `"src/auth/jwt.ts"`)
 
 #### `get_timeline` - Chronological Activity Feed
-Returns a chronological stream of project observations and events sorted newest first.
+Returns project and central observations sorted newest first by the entity's stored update timestamp.
 
 **Parameters:**
-- `since` (optional): ISO date string or timestamp filter
+- `since` (optional): Inclusive ISO date or Unix epoch cutoff. Numbers and numeric strings with an absolute value below `100000000000` are interpreted as seconds. Values at or above that threshold are milliseconds.
 - `entityType` (optional): Filter by entity type (task, bug, file, decision, project)
 - `limit` (optional, 1-100, default 20): Max events to return
 
@@ -355,7 +355,7 @@ List local agent-harness session stores (opencode, kilocode, zed, delta, antigra
 **Parameters:** None
 
 #### `sync_harness_sessions` - Sync Harness Sessions Into Memory
-Read-only sync of harness sessions (titles, summaries, timestamps; secrets redacted) into the knowledge graph as `session` entities named `harness:<harness>:<sessionId>`. Incremental via watermarks.
+Reads harness stores and syncs redacted session metadata into the knowledge graph as `harness:<harness>:<sessionId>` entities. The normal Antigravity sync also removes timestamps previously generated from Go's zero time and clears their invalid watermarks.
 
 **Parameters:**
 - `harnesses` (optional): Subset to sync (default: all found)

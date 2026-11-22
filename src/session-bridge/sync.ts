@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { MemoryManager } from '../memory-manager.js';
 import type { SQLiteManager } from '../sqlite-manager.js';
 import type { HarnessId, HarnessSession, SyncOptions, SyncResult } from './types.js';
@@ -10,13 +12,21 @@ import {
   extractDrizzleSessions,
   extractVscodeSessions,
   extractZedThreads,
+  MAX_HARNESS_EPOCH_MS,
+  type ExtractOptions,
 } from './extractors.js';
 import { cleanObservations } from './redact.js';
 
 const WATERMARK_TABLE = 'harness_sync';
+const LEGACY_TIMESTAMP = 'updated: +032971-04-28T00:00:00.000Z';
+
+function checkSql(result: { success: boolean; error?: string }, missingTable?: string): void {
+  if (result.success || (missingTable && result.error?.endsWith(`no such table: ${missingTable}`))) return;
+  throw new Error(result.error || 'Harness sync database operation failed');
+}
 
 async function ensureWatermarkTable(sqlite: SQLiteManager): Promise<void> {
-  await sqlite.executeSql(
+  const result = await sqlite.executeSql(
     'memory',
     `CREATE TABLE IF NOT EXISTS ${WATERMARK_TABLE} (
        harness TEXT NOT NULL,
@@ -25,33 +35,64 @@ async function ensureWatermarkTable(sqlite: SQLiteManager): Promise<void> {
        PRIMARY KEY (harness, session_id)
      )`,
   );
+  checkSql(result);
 }
 
-async function loadWatermarks(sqlite: SQLiteManager, harness: HarnessId): Promise<Map<string, number>> {
+async function loadWatermarks(sqlite: SQLiteManager, harness: HarnessId, ids: string[]): Promise<Map<string, number>> {
   const map = new Map<string, number>();
-  try {
-    const res = await sqlite.executeSql('memory', `SELECT session_id, synced_updated FROM ${WATERMARK_TABLE} WHERE harness = ?`, [harness]);
-    const rows = (res as unknown as { rows?: Array<{ session_id: string; synced_updated: number }> }).rows ?? [];
-    for (const r of rows) {
-      if (typeof r.session_id === 'string') map.set(r.session_id, Number(r.synced_updated) || 0);
-    }
-  } catch {
-    /* table may not exist yet on first run */
+  if (!ids.length || !existsSync(join(sqlite.getDatabasesPath(), 'memory.db'))) return map;
+  const result = await sqlite.executeSql('memory', `SELECT session_id, synced_updated FROM ${WATERMARK_TABLE}
+    WHERE harness = ? AND session_id IN (SELECT value FROM json_each(?))`, [harness, JSON.stringify(ids)], { readOnly: true });
+  checkSql(result, WATERMARK_TABLE);
+  for (const row of result.data?.rows ?? []) {
+    const { session_id, synced_updated } = row;
+    if (typeof session_id === 'string' && typeof synced_updated === 'number'
+      && synced_updated > 0 && synced_updated < MAX_HARNESS_EPOCH_MS) map.set(session_id, synced_updated);
   }
   return map;
 }
 
 async function saveWatermark(sqlite: SQLiteManager, harness: HarnessId, sessionId: string, updatedAt: number): Promise<void> {
-  await sqlite.executeSql(
+  const result = await sqlite.executeSql(
     'memory',
     `INSERT INTO ${WATERMARK_TABLE} (harness, session_id, synced_updated) VALUES (?, ?, ?)
-     ON CONFLICT(harness, session_id) DO UPDATE SET synced_updated = excluded.synced_updated`,
-    [harness, sessionId, Math.floor(updatedAt)],
+     ON CONFLICT(harness, session_id) DO UPDATE SET synced_updated = excluded.synced_updated
+     WHERE synced_updated < excluded.synced_updated OR synced_updated >= ?`,
+    [harness, sessionId, updatedAt, MAX_HARNESS_EPOCH_MS],
   );
+  checkSql(result);
+}
+
+async function repairLegacyTimestamps(sqlite: SQLiteManager, memory: MemoryManager): Promise<void> {
+  for (const database of ['memory', memory.getCentralDatabaseId()]) {
+    const dbPath = database === 'memory' ? join(sqlite.getDatabasesPath(), 'memory.db') : database;
+    if (!existsSync(dbPath)) continue;
+    const result = await sqlite.executeSql(database, `UPDATE entities SET observations = (
+      SELECT json_group_array(observation) FROM (
+        SELECT CASE WHEN value LIKE ? THEN substr(value, 1, length(value) - ?) ELSE value END AS observation
+        FROM json_each(entities.observations) WHERE value <> ? ORDER BY key
+      )
+    ) WHERE name GLOB 'harness:antigravity:*' AND entity_type = 'session' AND json_valid(observations)
+      AND EXISTS (SELECT 1 FROM json_each(observations) WHERE value = ? OR value LIKE ?)`,
+    [`% | ${LEGACY_TIMESTAMP}`, LEGACY_TIMESTAMP.length + ' | '.length, LEGACY_TIMESTAMP,
+      LEGACY_TIMESTAMP, `% | ${LEGACY_TIMESTAMP}`]);
+    checkSql(result, 'entities');
+  }
+  const result = await sqlite.executeSql('memory',
+    `DELETE FROM ${WATERMARK_TABLE} WHERE harness = 'antigravity' AND synced_updated >= ?`, [MAX_HARNESS_EPOCH_MS]);
+  checkSql(result);
 }
 
 function entityName(s: HarnessSession): string {
   return `harness:${s.harness}:${s.sessionId}`;
+}
+
+async function existingEntities(sqlite: SQLiteManager, names: string[]): Promise<Set<string>> {
+  if (!names.length || !existsSync(join(sqlite.getDatabasesPath(), 'memory.db'))) return new Set();
+  const result = await sqlite.executeSql('memory', 'SELECT name FROM entities WHERE name IN (SELECT value FROM json_each(?))',
+    [JSON.stringify(names)], { readOnly: true });
+  checkSql(result, 'entities');
+  return new Set((result.data?.rows ?? []).map(row => row.name).filter(name => typeof name === 'string'));
 }
 
 function sessionObservations(s: HarnessSession): string[] {
@@ -70,7 +111,7 @@ function sessionObservations(s: HarnessSession): string[] {
 async function extractFor(
   harness: HarnessId,
   path: string,
-  opts: { limit: number; since?: number; project?: string; includeArchived: boolean },
+  opts: ExtractOptions,
 ): Promise<{ sessions: HarnessSession[]; note?: string }> {
   switch (harness) {
     case 'opencode':
@@ -101,7 +142,10 @@ export async function syncHarnessSessions(
   const includeArchived = opts.includeArchived ?? false;
   const wanted = new Set(opts.harnesses ?? []);
   const results: SyncResult[] = [];
-  await ensureWatermarkTable(sqlite);
+  if (!opts.dryRun) {
+    await ensureWatermarkTable(sqlite);
+    if (!wanted.size || wanted.has('antigravity')) await repairLegacyTimestamps(sqlite, memory);
+  }
 
   for (const store of locateStores()) {
     if (wanted.size > 0 && !wanted.has(store.harness)) continue;
@@ -116,36 +160,37 @@ export async function syncHarnessSessions(
         since: opts.since,
         project: opts.project,
         includeArchived,
+        onInvalidTimestamp: (id, field, reason) => {
+          result.skipped++;
+          result.errors.push(`${id}: skipped ${field} timestamp (${reason})`);
+        },
       });
       if (note) result.errors.push(note);
-      result.scanned = sessions.length;
-      const watermarks = opts.dryRun ? new Map<string, number>() : await loadWatermarks(sqlite, store.harness);
+      result.scanned = sessions.length + result.skipped;
+      const watermarks = await loadWatermarks(sqlite, store.harness, sessions.map(s => s.sessionId));
+      const pending = sessions.filter(s => (watermarks.get(s.sessionId) ?? -1) < s.updatedAt);
+      const existing = await existingEntities(sqlite, pending.map(entityName));
       for (const s of sessions) {
         const known = watermarks.get(s.sessionId) ?? -1;
-        if (!opts.dryRun && known >= s.updatedAt) {
+        if (known >= s.updatedAt) {
           result.skipped++;
           result.sessions?.push({ sessionId: s.sessionId, title: s.title, updatedAt: s.updatedAt, action: 'skipped' });
           continue;
         }
-        const isUpdate = known >= 0;
-        if (opts.dryRun) {
-          result.sessions?.push({ sessionId: s.sessionId, title: s.title, updatedAt: s.updatedAt, action: 'dry-run' });
-          if (isUpdate) result.updated++;
-          else result.created++;
-          continue;
-        }
         try {
           const name = entityName(s);
-          const existing = await memory.openNodes([name]);
-          if (!existing.some((e) => e && e.name === name)) {
-            await memory.createEntity(name, 'session', sessionObservations(s));
-            result.created++;
-          } else {
-            await memory.addObservation(name, sessionObservations(s));
-            result.updated++;
+          const isUpdate = existing.has(name);
+          const action = isUpdate ? 'updated' : 'created';
+          if (!opts.dryRun) {
+            const observations = sessionObservations(s);
+            if (isUpdate) await memory.addObservation(name, observations);
+            else await memory.createEntity(name, 'session', observations);
+            await saveWatermark(sqlite, store.harness, s.sessionId, s.updatedAt);
           }
-          await saveWatermark(sqlite, store.harness, s.sessionId, s.updatedAt);
-          result.sessions?.push({ sessionId: s.sessionId, title: s.title, updatedAt: s.updatedAt, action: isUpdate ? 'updated' : 'created' });
+          existing.add(name);
+          watermarks.set(s.sessionId, s.updatedAt);
+          result[action]++;
+          result.sessions?.push({ sessionId: s.sessionId, title: s.title, updatedAt: s.updatedAt, action: opts.dryRun ? 'dry-run' : action });
         } catch (e) {
           result.errors.push(`${s.sessionId}: ${e instanceof Error ? e.message : String(e)}`);
         }

@@ -264,7 +264,7 @@ export const GetFileContextSchema = z.object({
 export type GetFileContextInput = z.infer<typeof GetFileContextSchema>;
 
 export const GetTimelineSchema = z.object({
-  since: z.string().optional(),
+  since: z.union([z.string(), z.number()]).optional(),
   entityType: z.string().optional(),
   limit: z.number().int().min(1).max(100).default(20).optional(),
 });

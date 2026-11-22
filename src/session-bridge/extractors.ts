@@ -2,6 +2,7 @@ import sqlite3 from 'sqlite3';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import type { HarnessSession } from './types.js';
+import { parseIsoDate, parseNumericTimestamp } from '../utils/timestamps.js';
 
 const BUSY_TIMEOUT_MS = 2000;
 const MAX_TEXT_CHARS = 1200;
@@ -33,10 +34,29 @@ function closeQuiet(db: sqlite3.Database): Promise<void> {
   return new Promise((resolve) => db.close(() => resolve()));
 }
 
-function toMs(v: unknown): number {
-  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Date.parse(v)) && /[-T:/]/.test(v) ? Date.parse(v) : Number(v);
-  if (!Number.isFinite(n) || n <= 0) return Date.now();
-  return n < 1e12 ? Math.floor(n * 1000) : Math.floor(n);
+export const MAX_HARNESS_EPOCH_MS = Date.UTC(10_000, 0, 1);
+
+function readUpdatedAt(
+  value: unknown,
+  format: 'epoch-ms' | 'iso' | 'file-mtime',
+  sessionId: string,
+  field: string,
+  opts: ExtractOptions,
+): number | undefined {
+  let ms = parseNumericTimestamp(value);
+  const missing = value == null || (typeof value === 'string' && value.trim() === '') || ms === 0
+    || (typeof value === 'string' && /^0001-01-01(?:[T ]|$)/.test(value.trim()));
+  if (!missing) {
+    if (Number.isNaN(ms) && format === 'iso' && typeof value === 'string') {
+      ms = parseIsoDate(value);
+    } else if (format !== 'file-mtime' && ms >= 1e9 && ms < 1e10) {
+      // Legacy numeric values in the ten-digit Unix-seconds range predate these harnesses if read as milliseconds.
+      ms *= 1000;
+    }
+    if (Number.isFinite(ms) && ms >= 1 && ms < MAX_HARNESS_EPOCH_MS) return Math.floor(ms);
+  }
+  opts.onInvalidTimestamp?.(sessionId, field, missing ? 'missing or zero' : 'invalid or out of range');
+  return undefined;
 }
 
 function clip(s: string, max: number = MAX_TEXT_CHARS): string {
@@ -111,6 +131,7 @@ export interface ExtractOptions {
   since?: number;
   project?: string;
   includeArchived?: boolean;
+  onInvalidTimestamp?: (sessionId: string, field: string, reason: string) => void;
 }
 
 function matchProject(project: string | undefined, filter?: string): boolean {
@@ -137,12 +158,12 @@ export async function extractDrizzleSessions(
     const out: HarnessSession[] = [];
     for (const r of rows) {
       if (typeof r['id'] !== 'string') continue;
-      const updatedAt = toMs(r['time_updated']);
-      if (opts.since && updatedAt <= opts.since) continue;
       const archived = r['time_archived'] != null;
       if (archived && !opts.includeArchived) continue;
       const project = typeof r['directory'] === 'string' ? r['directory'] : undefined;
       if (!matchProject(project, opts.project)) continue;
+      const updatedAt = readUpdatedAt(r['time_updated'], 'epoch-ms', r['id'], 'time_updated', opts);
+      if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
       let model: string | undefined;
       try {
         const m = typeof r['model'] === 'string' ? JSON.parse(r['model']) : r['model'];
@@ -200,10 +221,10 @@ export async function extractZedThreads(dbPath: string, opts: ExtractOptions = {
     const out: HarnessSession[] = [];
     for (const r of rows) {
       if (typeof r['id'] !== 'string') continue;
-      const updatedAt = toMs(r['updated_at']);
-      if (opts.since && updatedAt <= opts.since) continue;
       const summary = typeof r['summary'] === 'string' ? r['summary'] : undefined;
       if (opts.project && summary && !matchProject(summary, opts.project)) continue;
+      const updatedAt = readUpdatedAt(r['updated_at'], 'iso', r['id'], 'updated_at', opts);
+      if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
       let snippet: string | undefined;
       const blob = r['data'];
       if (blob && (typeof blob === 'string' || Buffer.isBuffer(blob))) {
@@ -241,12 +262,13 @@ export async function extractDeltaThreads(dbPath: string, opts: ExtractOptions =
     const out: HarnessSession[] = [];
     for (const r of rows) {
       if (typeof r['id'] !== 'string') continue;
-      const updatedAt = toMs(r['last_prompted_at'] ?? r['created_at']);
-      if (opts.since && updatedAt <= opts.since) continue;
       const archived = Number(r['archived'] ?? 0) !== 0;
       if (archived && !opts.includeArchived) continue;
       const name = typeof r['name'] === 'string' && r['name'] ? r['name'] : '(delta thread)';
       if (!matchProject(name, opts.project)) continue;
+      const field = r['last_prompted_at'] == null ? 'created_at' : 'last_prompted_at';
+      const updatedAt = readUpdatedAt(r[field], 'epoch-ms', r['id'], field, opts);
+      if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
       out.push({
         harness: 'delta',
         sessionId: r['id'],
@@ -276,8 +298,6 @@ export async function extractAntigravityConversations(dbPath: string, opts: Extr
     const out: HarnessSession[] = [];
     for (const r of rows) {
       if (typeof r['conversation_id'] !== 'string') continue;
-      const updatedAt = toMs(r['last_modified_time']);
-      if (opts.since && updatedAt <= opts.since) continue;
       let project: string | undefined;
       if (typeof r['project_id'] === 'string' && r['project_id']) project = r['project_id'];
       else if (typeof r['workspace_uris'] === 'string' && r['workspace_uris']) {
@@ -290,6 +310,8 @@ export async function extractAntigravityConversations(dbPath: string, opts: Extr
         }
       }
       if (!matchProject(project, opts.project)) continue;
+      const updatedAt = readUpdatedAt(r['last_modified_time'], 'iso', r['conversation_id'], 'last_modified_time', opts);
+      if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
       const title = typeof r['title'] === 'string' && r['title'] ? r['title'] : '(antigravity conversation)';
       const preview = typeof r['preview'] === 'string' && r['preview'] ? clip(r['preview'], 500) : undefined;
       const agent = typeof r['agent_name'] === 'string' && r['agent_name'] ? r['agent_name'] : undefined;
@@ -356,8 +378,10 @@ export async function extractCodexSessions(
   const maxLines = Math.min(Math.max(opts.maxLinesPerFile ?? 400, 50), 2000);
   for (const f of files) {
     if (out.length >= limit) break;
-    if (opts.since && f.mtime <= opts.since) continue;
     if (f.archived && !opts.includeArchived) continue;
+    const fileId = basename(f.path).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
+    const updatedAt = readUpdatedAt(f.mtime, 'file-mtime', fileId, 'file mtime', opts);
+    if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
     let meta: Record<string, unknown> | undefined;
     let firstUser: string | undefined;
     let firstUserFallback: string | undefined;
@@ -407,10 +431,10 @@ export async function extractCodexSessions(
     if (opts.project && !matchProject(cwd, opts.project) && !matchProject(title, opts.project)) continue;
     out.push({
       harness: 'codex',
-      sessionId: metaId ?? basename(f.path).replace(/^rollout-/, '').replace(/\.jsonl$/, ''),
+      sessionId: metaId ?? fileId,
       project: cwd,
       title,
-      updatedAt: Math.floor(f.mtime),
+      updatedAt,
       messageCount: userCount + assistantCount,
       model,
       archived: f.archived,
@@ -455,8 +479,9 @@ export async function extractCursorSessions(
         const id = typeof rec['id'] === 'string' ? rec['id'] : typeof rec['conversationId'] === 'string' ? String(rec['conversationId']) : undefined;
         if (!id) continue;
         const title = typeof rec['title'] === 'string' && rec['title'] ? clip(rec['title'], 140) : '(cursor composer)';
-        const updatedAt = toMs(rec['updatedAt'] ?? rec['lastUpdated'] ?? Date.now());
-        if (opts.since && updatedAt <= opts.since) continue;
+        const field = rec['updatedAt'] == null ? 'lastUpdated' : 'updatedAt';
+        const updatedAt = readUpdatedAt(rec[field], 'epoch-ms', id, field, opts);
+        if (updatedAt === undefined || (opts.since && updatedAt <= opts.since)) continue;
         out.push({ harness: 'cursor', sessionId: id, title, updatedAt });
       }
     } catch {

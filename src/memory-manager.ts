@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { ObsidianVaultMirror, uniqueObservations, observationHash } from './obsidian-vault.js';
 import { createHash } from 'crypto';
 import { sanitizePrivateContent } from './utils/sanitize.js';
+import { parseIsoDate, parseNumericTimestamp } from './utils/timestamps.js';
 import {
   ObservationProvenance,
   ensureObservationProvenanceSchema,
@@ -1793,24 +1794,34 @@ export class MemoryManager {
     };
   }
 
-  async getTimeline(options: { since?: string; entityType?: string; limit?: number } = {}): Promise<TimelineResult> {
+  async getTimeline(options: { since?: string | number; entityType?: string; limit?: number } = {}): Promise<TimelineResult> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
 
     const deleted = await this.readDeletedNames();
-    let sql = `SELECT name, entity_type, observations, created_at, updated_at FROM entities
-      WHERE name NOT IN (SELECT value FROM json_each(?))`;
+    const timestamp = 'CASE WHEN julianday(updated_at) IS NOT NULL THEN updated_at ELSE created_at END';
+    const timeOrder = `julianday(${timestamp})`;
+    let sql = `SELECT name, entity_type, observations, ${timestamp} AS timestamp, ${timeOrder} AS time_order
+      FROM entities WHERE name NOT IN (SELECT value FROM json_each(?))`;
     const params: unknown[] = [JSON.stringify([...deleted])];
 
     if (options.entityType) {
       sql += ' AND entity_type = ?';
       params.push(options.entityType);
     }
-    if (options.since) {
-      sql += ' AND updated_at >= ?';
-      params.push(options.since);
+    if (options.since !== undefined) {
+      const numeric = parseNumericTimestamp(options.since);
+      const ms = Number.isNaN(numeric) && typeof options.since === 'string'
+        ? parseIsoDate(options.since)
+        : Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric;
+      const since = new Date(ms);
+      if (!Number.isFinite(since.getTime()) || since.getUTCFullYear() < 0 || since.getUTCFullYear() > 9999) {
+        throw new Error('Invalid timeline since: expected an ISO date or Unix epoch timestamp');
+      }
+      sql += ` AND ${timeOrder} >= julianday(?)`;
+      params.push(since.toISOString());
     }
-    sql += ' ORDER BY updated_at DESC LIMIT ?';
+    sql += ' ORDER BY time_order DESC, name LIMIT ?';
     params.push(limit);
 
     const [pRes, cRes] = await Promise.all([
@@ -1818,45 +1829,26 @@ export class MemoryManager {
       this.sqliteManager.executeSql(this.centralDbPath, sql, params),
     ]);
 
-    const toRows = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => memoryRowSchemas.entities.parse(row)) : [];
-    const combinedRows = [...toRows(pRes), ...toRows(cRes)];
+    const rowSchema = z.object({ name: z.string(), entity_type: z.string(), observations: z.string(),
+      timestamp: z.string(), time_order: z.number().nullable() });
+    const toRows = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => rowSchema.parse(row)) : [];
+    const rowsByName = new Map([...toRows(cRes), ...toRows(pRes)].map(row => [row.name, row]));
+    const sortedRows = [...rowsByName.values()].sort((a, b) =>
+      (b.time_order ?? -1) - (a.time_order ?? -1) || a.name.localeCompare(b.name));
 
-    const seen = new Set<string>();
-    const entries: TimelineEntry[] = [];
-
-    for (const row of combinedRows) {
-      if (seen.has(row.name)) continue;
-      seen.add(row.name);
-
-      const obsList: string[] = this.safeParseObservations(row.observations);
-      const recentObs = obsList.slice(-3).reverse();
-      if (recentObs.length === 0) {
-        entries.push({
-          entityName: row.name,
-          entityType: row.entity_type,
-          observation: 'Entity updated',
-          timestamp: row.updated_at || row.created_at,
-        });
-      } else {
-        for (const obs of recentObs) {
-          const match = obs.match(/^\[(.*?)\]/);
-          const timestamp = match ? match[1] : (row.updated_at || row.created_at);
-          entries.push({
-            entityName: row.name,
-            entityType: row.entity_type,
-            observation: obs,
-            timestamp,
-          });
-        }
-      }
-    }
-
-    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-    const cappedEntries = entries.slice(0, limit);
+    const entries: TimelineEntry[] = sortedRows.flatMap(row => {
+      const recent = this.safeParseObservations(row.observations).slice(-3).reverse();
+      return (recent.length ? recent : ['Entity updated']).map(observation => ({
+        entityName: row.name,
+        entityType: row.entity_type,
+        observation,
+        timestamp: row.timestamp,
+      }));
+    }).slice(0, limit);
 
     return {
-      entries: cappedEntries,
-      total: cappedEntries.length,
+      entries,
+      total: entries.length,
     };
   }
 

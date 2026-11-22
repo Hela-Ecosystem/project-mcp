@@ -86,6 +86,7 @@ describe('genome envelope (P1-C1)', () => {
     expect(resolveSideEffects('harness_sessions', { action: 'list' })).toEqual([]);
     expect(resolveSideEffects('harness_sessions', { action: 'sync' }))
       .toEqual(['memory-write']);
+    expect(resolveSideEffects('harness_sessions', { action: 'sync', dryRun: true })).toEqual([]);
   });
 
   test('appendWarning preserves legacy payload and adds a visible warning', () => {

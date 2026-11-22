@@ -181,6 +181,35 @@ describe('Claude-Mem Enhancement Features for HeLa-Genome', () => {
   });
 
   describe('Feature D: Chronological Timeline Feed (get_timeline)', () => {
+    test('filters by epoch seconds or milliseconds and orders stored timestamps across databases', async () => {
+      await memoryManager.createEntity('task:old', 'task', ['[FIX] older task']);
+      await memoryManager.createEntity('task:project', 'task', ['[VERIFIED] project task']);
+      await memoryManager.syncToCentral();
+      const central = memoryManager.getCentralDatabaseId();
+      const cutoff = '2026-09-05T10:00:00.000Z';
+      const newest = '2026-09-05T09:30:00-01:00';
+      const older = '2026-09-05T09:59:59.999Z';
+      const writes = await Promise.all([
+        sqliteManager.updateData('memory', 'entities', { name: 'task:old' }, { updated_at: older }),
+        sqliteManager.updateData(central, 'entities', { name: 'task:old' }, { updated_at: older }),
+        sqliteManager.updateData('memory', 'entities', { name: 'task:project' }, { updated_at: cutoff }),
+        sqliteManager.updateData(central, 'entities', { name: 'task:project' }, { updated_at: cutoff }),
+        sqliteManager.executeSql(central, 'INSERT INTO entities VALUES (?, ?, ?, ?, ?)',
+          ['task:central', 'task', JSON.stringify(['[2000-01-01] central task']), older, newest]),
+      ]);
+      expect(writes.every(write => write.success)).toBe(true);
+
+      const ms = Date.parse(cutoff);
+      for (const since of [ms, ms / 1000, String(ms), cutoff]) {
+        const result = await requestHandlers.handleToolCall('get_timeline', { since }) as ToolResponse<TimelineResult>;
+        expect(result.data.entries.map(({ entityName, timestamp }) => [entityName, timestamp])).toEqual([
+          ['task:central', newest],
+          ['task:project', cutoff],
+        ]);
+        expect(result.data.entries[1].observation).toBe('[VERIFIED] project task');
+      }
+    });
+
     test('returns chronological events across entities', async () => {
       const now = new Date().toISOString();
       await memoryManager.createEntity('task:step1', 'task', [

@@ -144,11 +144,14 @@ export const memoryTools: Tool[] = [
   },
   {
     name: 'get_timeline',
-    description: 'Get a chronological feed of recent observations and project activity',
+    description: 'Get recent observations and project activity, newest first',
     inputSchema: {
       type: 'object',
       properties: {
-        since: { type: 'string', description: 'ISO date string or timestamp filter' },
+        since: {
+          type: ['string', 'number'],
+          description: 'Inclusive cutoff as an ISO date, Unix epoch number, or numeric string. Absolute numeric values below 100000000000 are seconds, otherwise milliseconds.',
+        },
         entityType: { type: 'string', description: 'Filter by entity type (task, bug, decision, file, project)' },
         limit: { type: 'number', description: 'Max events to return (1-100, default 20)' },
       },
