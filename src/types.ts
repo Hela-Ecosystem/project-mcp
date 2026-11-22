@@ -300,6 +300,7 @@ export const CacheKeySchema = z.string().min(1).max(512).regex(
 
 export const GetSessionContextSchema = z.object({
   limit: z.number().int().min(1).max(50).default(10),
+  scope: z.enum(['project', 'merged']).optional(),
 }).strict();
 
 export const AnalyzeGitChangesSchema = z.object({

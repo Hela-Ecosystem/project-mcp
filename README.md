@@ -313,7 +313,7 @@ Remove relationships between project entities (supports single or batch).
 Retrieve the full knowledge graph, merging the active project database with the central aggregate. Project entries win over central entries with the same name. Supports pagination.
 
 **Parameters:**
-- `database` (optional): `"project"` (default, merged), `"central"` (only central)
+- `database` (optional): Omit to merge both stores. Use `"project"` or `"central"` to read one store.
 - `limit` (optional, 1-10000, default 5000): Max entities/relations to return, `ORDER BY updated_at DESC`
 - `offset` (optional, 0+): Rows to skip
 
@@ -417,10 +417,12 @@ Claim a queued, unowned mission or report its lifecycle progress (e.g. marking `
 The canonical wrappers are `security_scan` and `cache`. The `scan_*` and `cache_*` entry points below are legacy aliases; use the action-based wrappers in new integrations.
 
 #### `sync_central_memory`
-Merge the active project knowledge graph into the central memory database (`~/memory/memory.db` by default, override with `GUARDIAN_CENTRAL_DB`). Observation unions preserve independent facts and their existing order; entity type follows the newer timestamp, and relations are unique by endpoints/type. Central imports use the same additive merge instead of overwriting local observations. Every memory write also syncs automatically; call this tool to force a sync on demand. The first sync of each day also snapshots the central database and prunes old backups beyond the newest seven. Central memory remains an aggregate, not a deletion-propagating replica or a mission ledger synchronizer.
+Publish the active project graph to central memory (`~/memory/memory.db` by default, override with `GUARDIAN_CENTRAL_DB`). To import the central graph, call `obsidian_vault` with `action: "sync_from_central"`. Both directions preserve independent observations and merge relations by endpoints and type. Both also share entity tombstones, remove stale copies and their relations, and prevent sync from restoring a deleted name. Results report merged `entities` and `relations`, entity rows removed per store in `deleted`, and source rows omitted due to tombstones in `skipped`.
+
+Once central records a deletion, that entity name stays reserved across projects. Memory writes also publish automatically. The first publish of each day snapshots the central database and keeps the seven newest backups.
 
 #### `set_project_root`
-Switch the active project memory database to the given absolute project path. Use this at session start when the server was launched outside the project directory, so memory is written to the project instead of the shared fallback database.
+Switch the active project memory database to the given absolute project path. The switch opens the project without importing or publishing memory.
 
 - `path` (required): Absolute path to the project root. Inside a Git repository, the toplevel is used.
 
@@ -431,6 +433,7 @@ Create a `.pre-commit-config.yaml` in the active project root and install the Gi
 Summarize active tasks, open bugs, recent changes, blockers, and the next suggested action directly from the knowledge graph.
 
 - `limit` (optional, 1-50, default 10): Maximum entries per result group.
+- `scope` (optional, default `project`): Use `merged` to include central memory.
 
 #### `analyze_git_changes`
 Return exact machine-readable changed paths from Git, including renames and optionally untracked files.

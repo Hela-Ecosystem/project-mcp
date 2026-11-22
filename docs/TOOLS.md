@@ -40,7 +40,7 @@ Invoke a project guidance framework to receive specialized instructions and chec
 
 ## `get_session_context`
 
-Summarize active tasks, open bugs, recent changes, and blockers from project memory
+Summarize active tasks, open bugs, recent changes, and blockers from project memory. Set `scope` to `merged` to include central memory.
 
 ## `get_timeline`
 
@@ -120,7 +120,7 @@ Actions: `secrets`, `container`.
 
 ## `set_project_root`
 
-Switch the active project memory database to the given absolute project path. Use at session start when the server was launched outside the project directory
+Switch the active memory database to the given absolute project path without importing or publishing memory.
 
 ## `setup_pre_commit`
 
@@ -128,7 +128,7 @@ Create a .pre-commit-config.yaml in the active project root and install the Git 
 
 ## `sync_central_memory`
 
-Sync the active project knowledge graph into the central memory database (~/memory/memory.db by default) so all projects share one searchable map
+Publish the active project graph to central memory, reconcile entity deletions in both stores, and report skipped entities and relations.
 
 ## `update_data`
 

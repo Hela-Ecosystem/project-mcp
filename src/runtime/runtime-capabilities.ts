@@ -57,7 +57,7 @@ export class RuntimeCapabilities {
   }
 
   async getSessionContext(input: GetSessionContextInput) {
-    const graph = await this.memoryManager.readGraph();
+    const graph = await this.memoryManager.readGraph({ scope: input.scope ?? 'project' });
     const entities = graph.entities
       .slice()
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));

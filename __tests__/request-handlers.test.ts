@@ -7,6 +7,7 @@ import { existsSync, unlinkSync, rmdirSync, readdirSync, mkdtempSync, rmSync } f
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { RuntimeCapabilities } from '../src/runtime/runtime-capabilities';
+import { PathGuard } from '../src/runtime/path-guard';
 
 describe('RequestHandlers', () => {
   let sqliteManager: SQLiteManager;
@@ -24,12 +25,14 @@ describe('RequestHandlers', () => {
     importExportManager = new ImportExportManager(sqliteManager);
     memoryManager = new MemoryManager(sqliteManager);
     inspectedTexts = [];
+    const runtime = new RuntimeCapabilities(memoryManager, sqliteManager, new PathGuard(testDbPath));
     runtimeCapabilities = {
       inspectUntrustedText: (input: unknown) => {
         inspectedTexts.push(input);
         return { suspicious: false, alerts: [] };
       },
-      setWorkspaceRoot: () => {},
+      getSessionContext: runtime.getSessionContext.bind(runtime),
+      setWorkspaceRoot: runtime.setWorkspaceRoot.bind(runtime),
     } as unknown as RuntimeCapabilities;
     requestHandlers = new RequestHandlers(
       sqliteManager,
@@ -261,13 +264,101 @@ describe('RequestHandlers', () => {
       await expect(requestHandlers.handleToolCall('read_graph', { database: 'central' })).resolves.toMatchObject({
         data: { entities: [expect.objectContaining({ name })] }
       });
-      await expect(memoryManager.syncFromCentral({ restoreDeleted: false })).resolves.toHaveProperty('entities', 0);
+      await expect(requestHandlers.handleToolCall('read_graph', {})).resolves.toMatchObject({ data: { entities: [] } });
+      await expect(requestHandlers.handleToolCall('read_graph_stream', {})).resolves.toMatchObject({ data: { entities: [] } });
       await expect(open()).resolves.toMatchObject({ data: [] });
 
       await expect(create('Recreated content')).resolves.toHaveProperty('message', 'Created 1 entities');
       const recreated = expect.objectContaining({ name, observations: ['Recreated content'] });
       await expect(open()).resolves.toMatchObject({ data: [recreated] });
       await expect(search()).resolves.toMatchObject({ data: { entities: [recreated] } });
+    });
+
+    test.each(['push', 'pull'])('propagates a deletion to central and removes stale project copies on %s', async direction => {
+      const name = 'task:deleted-across-projects';
+      const survivor = 'task:survivor';
+      const central = memoryManager.getCentralDatabaseId();
+      const secondRoot = mkdtempSync(join(tmpdir(), 'guardian-second-root-'));
+      const secondSqlite = new SQLiteManager(secondRoot);
+      const second = new MemoryManager(secondSqlite, secondRoot);
+      const push = () => requestHandlers.handleToolCall('sync_central_memory', {});
+      try {
+        await memoryManager.createEntities([name, survivor].map(name => ({ name, entityType: 'task', observations: ['Original'] })));
+        await memoryManager.createRelation(name, survivor, 'blocks');
+        await push();
+        await second.syncFromCentral();
+        expect((await second.readStore('memory')).entities.map(entity => entity.name).sort()).toEqual([name, survivor]);
+        await expect(memoryManager.deleteEntity(name)).resolves.toBe(1);
+
+        await expect(push()).resolves.toMatchObject({ data: { deleted: { central: 1 } } });
+        await expect(sqliteManager.queryData(central, 'entities', { name })).resolves.toMatchObject({ success: true, data: { rows: [] } });
+        await expect(second.openNode(name)).resolves.toBeNull();
+        expect((await second.searchNodes('deleted-across-projects')).entities).toEqual([]);
+        expect((await second.readGraphStream()).relations).toEqual([]);
+
+        const reconciliation = direction === 'push' ? second.syncToCentral() : second.syncFromCentral();
+        await expect(reconciliation).resolves.toMatchObject({
+          deleted: { project: 1, central: 0 },
+          skipped: direction === 'push' ? { entities: 1, relations: 1 } : { entities: 0, relations: 0 },
+        });
+        for (let i = 0; i < 2; i++) {
+          await second.syncFromCentral();
+          await Promise.all([push(), second.syncToCentral()]);
+        }
+        for (const [manager, database] of [[second, 'memory'], [memoryManager, central]] as const) {
+          const graph = await manager.readStore(database);
+          expect(graph.entities.map(entity => entity.name)).toEqual([survivor]);
+          expect(graph.relations).toEqual([]);
+        }
+      } finally {
+        await secondSqlite.closeAllConnections();
+        rmSync(secondRoot, { recursive: true, force: true });
+      }
+    });
+
+    test('reports a central copy skipped by a pending project deletion on pull', async () => {
+      const name = 'task:project-tombstone';
+      await memoryManager.createEntity(name, 'task', ['Original']);
+      await memoryManager.syncToCentral();
+      await memoryManager.deleteEntity(name);
+
+      await expect(requestHandlers.handleToolCall('obsidian_vault', { action: 'sync_from_central' })).resolves.toMatchObject({
+        data: { entities: 0, skipped: { entities: 1 }, deleted: { central: 1 } },
+      });
+      await expect(memoryManager.openNode(name)).resolves.toBeNull();
+      expect((await memoryManager.readStore(memoryManager.getCentralDatabaseId())).entities).toEqual([]);
+    });
+
+    test('retains pending deletions when a central sync fails and retries them successfully', async () => {
+      const central = memoryManager.getCentralDatabaseId();
+      const name = 'task:retry-deletion';
+      await memoryManager.createEntity(name, 'task', ['Original']);
+      await memoryManager.syncToCentral();
+      await memoryManager.deleteEntity(name);
+      const trigger = await sqliteManager.executeSql(central, `CREATE TRIGGER fail_sync BEFORE DELETE ON entities
+        BEGIN SELECT RAISE(ABORT, 'injected sync failure'); END`);
+      expect(trigger.success).toBe(true);
+
+      await expect(memoryManager.syncToCentral()).rejects.toThrow('injected sync failure');
+      expect((await memoryManager.readStore(central)).entities.map(entity => entity.name)).toEqual([name]);
+      await expect(sqliteManager.queryData(central, 'deleted_entities', { name })).resolves.toMatchObject({ success: true, data: { rows: [] } });
+
+      expect((await sqliteManager.executeSql(central, 'DROP TRIGGER fail_sync')).success).toBe(true);
+      await expect(memoryManager.syncToCentral()).resolves.toMatchObject({ deleted: { central: 1 } });
+      expect((await memoryManager.readStore(central)).entities).toEqual([]);
+    });
+
+    test('honors deletions made directly in central', async () => {
+      const name = 'task:central-deletion';
+      const central = memoryManager.getCentralDatabaseId();
+      await memoryManager.createEntity(name, 'task', ['Original']);
+      await memoryManager.syncToCentral();
+      await expect(sqliteManager.deleteData(central, 'entities', { name })).resolves.toMatchObject({ data: { changes: 1 } });
+
+      await expect(memoryManager.syncFromCentral()).resolves.toMatchObject({ deleted: { project: 1 } });
+      await expect(memoryManager.createEntity(name, 'task', ['Stale copy'])).rejects.toThrow('deleted from central memory');
+      expect((await memoryManager.readStore('memory')).entities).toEqual([]);
+      expect((await memoryManager.readStore(central)).entities).toEqual([]);
     });
 
     test('should count deleted rows and report each missing name', async () => {
@@ -329,8 +420,21 @@ describe('RequestHandlers', () => {
     test('should reinitialize schema after set_project_root', async () => {
       const targetRoot = mkdtempSync(join(tmpdir(), 'guardian-root-'));
       try {
+        await memoryManager.createEntity('task:previous-root', 'task', ['Central only after switch']);
+        await memoryManager.syncToCentral();
+        process.env.NODE_ENV = 'production';
         const switched = await requestHandlers.handleToolCall('set_project_root', { path: targetRoot });
+        process.env.NODE_ENV = 'test';
         expect(switched).toHaveProperty('success', true);
+        await expect(requestHandlers.handleToolCall('read_graph', { database: 'project' })).resolves.toEqual({
+          success: true, data: { entities: [], relations: [] },
+        });
+        await expect(requestHandlers.handleToolCall('get_session_context', {})).resolves.toMatchObject({
+          data: { stats: { entities: 0 }, activeTasks: [] },
+        });
+        await expect(requestHandlers.handleToolCall('get_session_context', { scope: 'merged' })).resolves.toMatchObject({
+          data: { stats: { entities: 1 }, activeTasks: [expect.objectContaining({ name: 'task:previous-root' })] },
+        });
 
         const created = await requestHandlers.handleToolCall('memory_edit', {
           action: 'create_entities',
@@ -359,7 +463,14 @@ describe('RequestHandlers', () => {
           format: 'json'
         });
         expect(outside).toHaveProperty('success', false);
+
+        // The production switch used to upload all data in the destination root.
+        process.env.NODE_ENV = 'production';
+        await requestHandlers.handleToolCall('set_project_root', { path: targetRoot });
+        expect((await memoryManager.readStore(memoryManager.getCentralDatabaseId())).entities.map(entity => entity.name))
+          .toEqual(['task:previous-root']);
       } finally {
+        process.env.NODE_ENV = 'test';
         rmSync(targetRoot, { recursive: true, force: true });
       }
     });

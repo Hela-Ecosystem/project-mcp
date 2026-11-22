@@ -1,5 +1,5 @@
 import { ingestFeedbackSpool } from './feedback-spool.js';
-import { SQLiteManager } from './sqlite-manager.js';
+import { AttachedTransaction, SQLiteManager } from './sqlite-manager.js';
 import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
 import { DatabaseRow, DatabaseOperationResult, SqlExecutionData, memoryRowSchemas } from './types.js';
 import { z } from 'zod';
@@ -10,7 +10,6 @@ import {
   ObservationProvenance,
   ensureObservationProvenanceSchema,
   recordObservationProvenance,
-  ProvenanceRowSchema,
 } from './observation-provenance.js';
 import { embedText, toVecString } from './vector-manager.js';
 import {
@@ -29,6 +28,17 @@ import { createInterface } from 'readline';
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const MAX_CENTRAL_BACKUPS = 7;
+
+interface CentralSyncResult {
+  entities: number;
+  relations: number;
+  deleted: { project: number; central: number };
+  skipped: { entities: number; relations: number };
+}
+
+function isLiveRelation(relation: Relation, deleted: Set<string>): boolean {
+  return !deleted.has(relation.from) && !deleted.has(relation.to);
+}
 
 export class MemoryManager {
   private sqliteManager: SQLiteManager;
@@ -59,8 +69,6 @@ export class MemoryManager {
     if (process.env.NODE_ENV !== 'test') {
       (async () => {
         await this.ensureProjectSchema();
-        // Central <-> project sync: pull central entities into project (best-effort)
-        try { await this.syncFromCentral({ restoreDeleted: false }); } catch (e) { void e; }
         if (this.obsidianMirror.isEnabled()) {
           console.error('[obsidian] scheduling sync');
           try { await this.obsidianMirror.pullSync(); }
@@ -144,8 +152,17 @@ export class MemoryManager {
       ]
     });
     
+    await this.ensureTombstoneSchema(this.centralDbPath);
+    const preventRestore = await this.sqliteManager.executeSql(this.centralDbPath, `
+      CREATE TRIGGER IF NOT EXISTS entities_preserve_deletion BEFORE INSERT ON entities
+      WHEN EXISTS (SELECT 1 FROM deleted_entities WHERE name = new.name) BEGIN
+        SELECT RAISE(IGNORE);
+      END;
+    `);
+    if (!preventRestore.success) throw new Error(preventRestore.error);
     await this.ensureFtsSchema(this.centralDbPath);
     await this.ensureMissionsSchema(this.centralDbPath);
+    await ensureObservationProvenanceSchema(this.sqliteManager, this.centralDbPath);
     // Search-source feedback is a cross-project signal, so it lives centrally.
     await ensureSourceFeedbackSchema(this.sqliteManager, this.centralDbPath);
     try {
@@ -178,6 +195,18 @@ export class MemoryManager {
     await this.sqliteManager.executeSql(dbName, `CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);`);
   }
 
+  private async ensureTombstoneSchema(database: string): Promise<void> {
+    const result = await this.sqliteManager.executeSql(database,
+      'CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL)');
+    if (!result.success) throw new Error(result.error);
+    const markDeletion = await this.sqliteManager.executeSql(database, `
+      CREATE TRIGGER IF NOT EXISTS entities_mark_deletion AFTER DELETE ON entities BEGIN
+        INSERT OR IGNORE INTO deleted_entities (name) VALUES (old.name);
+      END;
+    `);
+    if (!markDeletion.success) throw new Error(markDeletion.error);
+  }
+
   private projectSchemaReady = false;
   private async ensureProjectSchema(): Promise<void> {
     if (this.projectSchemaReady) return;
@@ -191,16 +220,7 @@ export class MemoryManager {
         { name: 'updated_at', type: 'TEXT', constraints: ['NOT NULL'] }
       ]
     });
-    const deletedEntities = await this.sqliteManager.executeSql(this.memoryDbName,
-      'CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL)');
-    if (!deletedEntities.success) throw new Error(deletedEntities.error);
-    // A project deletion must suppress the central copy in the same SQLite statement.
-    const markDeletion = await this.sqliteManager.executeSql(this.memoryDbName, `
-      CREATE TRIGGER IF NOT EXISTS entities_mark_deletion AFTER DELETE ON entities BEGIN
-        INSERT OR IGNORE INTO deleted_entities (name) VALUES (old.name);
-      END;
-    `);
-    if (!markDeletion.success) throw new Error(markDeletion.error);
+    await this.ensureTombstoneSchema(this.memoryDbName);
     const restoreEntity = await this.sqliteManager.executeSql(this.memoryDbName, `
       CREATE TRIGGER IF NOT EXISTS entities_clear_deletion AFTER INSERT ON entities BEGIN
         DELETE FROM deleted_entities WHERE name = new.name;
@@ -262,63 +282,10 @@ export class MemoryManager {
     }
   }
 
-  async syncToCentral(): Promise<{ entities: number; relations: number }> {
-    const graph = await this.readStore(this.memoryDbName, { limit: 10000 });
-    if (graph.entities.length === 0 && graph.relations.length === 0) {
-      return { entities: 0, relations: 0 };
-    }
-
-    await this.ensureCentralSchema();
-    await this.sqliteManager.ensureSchemaVersion(this.centralDbPath);
-    // P1-C2: central sidecar so synced observations keep their provenance refs
-    await ensureObservationProvenanceSchema(this.sqliteManager, this.centralDbPath);
-
-    // batch in single transaction — was N separate writes, now 1 fsync
-    await this.sqliteManager.executeSql(this.centralDbPath, 'BEGIN TRANSACTION');
-    try {
-      for (const entity of graph.entities) {
-        const r = await this.sqliteManager.executeSql(
-          this.centralDbPath,
-          this.mergeEntitySql(),
-          [entity.name, entity.entityType, JSON.stringify(entity.observations), entity.createdAt, entity.updatedAt]
-        );
-        if (!r.success) throw new Error(r.error);
-        // P1-C2: carry the entity's provenance sidecar rows to central (idempotent)
-        const prov = await this.sqliteManager.executeSql(
-          this.memoryDbName,
-          `SELECT observation, source, retrieved_at, confidence, freshness FROM observation_provenance WHERE entity_name = ?`,
-          [entity.name]
-        );
-        if (prov.success && prov.data) {
-          for (const value of prov.data.rows ?? []) {
-            const row = ProvenanceRowSchema.parse(value);
-            const cp = await this.sqliteManager.executeSql(
-              this.centralDbPath,
-              `INSERT OR REPLACE INTO observation_provenance
-               (entity_name, observation, source, retrieved_at, confidence, freshness)
-               VALUES (?, ?, ?, ?, ?, ?)`,
-              [entity.name, row.observation, row.source, row.retrieved_at, row.confidence ?? null, row.freshness ?? null]
-            );
-            if (!cp.success) throw new Error(cp.error);
-          }
-        }
-      }
-      for (const relation of graph.relations) {
-        const r = await this.sqliteManager.executeSql(
-          this.centralDbPath,
-          `INSERT OR IGNORE INTO relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`,
-          [relation.from, relation.to, relation.relationType, relation.createdAt]
-        );
-        if (!r.success) throw new Error(r.error);
-      }
-      await this.sqliteManager.executeSql(this.centralDbPath, 'COMMIT');
-    } catch (e) {
-      try { await this.sqliteManager.executeSql(this.centralDbPath, 'ROLLBACK'); } catch (e) { void e; }
-      throw e;
-    }
-
+  async syncToCentral(): Promise<CentralSyncResult> {
+    const result = await this.syncCentral('push');
     await this.backupCentralIfNeeded();
-    return { entities: graph.entities.length, relations: graph.relations.length };
+    return result;
   }
 
   private async syncToCentralSafe(): Promise<void> {
@@ -330,59 +297,100 @@ export class MemoryManager {
     }
   }
 
-  async syncFromCentral({ restoreDeleted = true } = {}): Promise<{ entities: number; relations: number }> {
-    if (!this.projectSchemaReady) {
-      await this.ensureProjectSchema();
-      await this.sqliteManager.ensureSchemaVersion(this.memoryDbName);
-    }
-    await this.ensureCentralSchema();
-    let eCount = 0, rCount = 0;
+  async syncFromCentral(): Promise<CentralSyncResult> {
     try {
-      const centEntities = await this.sqliteManager.queryData(this.centralDbPath, 'entities', {}, 10000, 0, 'updated_at', 'DESC');
-      const centRelations = await this.sqliteManager.queryData(this.centralDbPath, 'relations', {}, 10000, 0);
-      const aliasResult = await this.sqliteManager.queryData(this.memoryDbName, 'entity_aliases', {}, 100000);
-      if (!aliasResult.success) throw new Error(aliasResult.error);
-      const aliases = new Map<string, string>((aliasResult.data?.rows || []).map(value => {
-        const row = memoryRowSchemas.entity_aliases.parse(value);
-        return [row.alias, row.canonical_name];
-      }));
-      const centralRelations: Relation[] = (centRelations.data?.rows || []).map(row => this.rowToRelation(row));
-      const mergeEntity = this.mergeEntitySql(restoreDeleted);
-      const insertRelation = `INSERT OR IGNORE INTO relations(from_entity, to_entity, relation_type, created_at)
-        ${restoreDeleted ? 'VALUES (?, ?, ?, ?)' : `SELECT ?, ?, ?, ?
-          WHERE NOT EXISTS (SELECT 1 FROM deleted_entities WHERE name IN (?, ?))`}`;
-      if (centEntities.success && centEntities.data) {
-        for (const row of centEntities.data.rows) {
-          const ent = this.rowToEntity(row);
-          ent.observations = this.cleanObservations(ent, centralRelations);
-          ent.name = aliases.get(ent.name) || ent.name;
-          const params = [ent.name, ent.entityType, JSON.stringify(ent.observations), ent.createdAt, ent.updatedAt];
-          if (!restoreDeleted) params.push(ent.name);
-          const result = await this.sqliteManager.executeSql(this.memoryDbName, mergeEntity, params);
-          if (!result.success) throw new Error(result.error);
-          eCount += result.data?.changes ?? 0;
-        }
-      }
-      if (centRelations.success && centRelations.data) {
-        for (const row of centRelations.data.rows) {
-          const rel = this.rowToRelation(row);
-          rel.from = aliases.get(rel.from) || rel.from;
-          rel.to = aliases.get(rel.to) || rel.to;
-          const params = [rel.from, rel.to, rel.relationType, rel.createdAt];
-          if (!restoreDeleted) params.push(rel.from, rel.to);
-          const result = await this.sqliteManager.executeSql(this.memoryDbName, insertRelation, params);
-          if (!result.success) throw new Error(result.error);
-          rCount += result.data?.changes || 0;
-        }
-      }
-    } catch (e) { throw new Error(`Central memory import failed: ${(e as Error).message}`); }
-    return { entities: eCount, relations: rCount };
+      return await this.syncCentral('pull');
+    } catch (error) {
+      throw new Error(`Central memory import failed: ${(error as Error).message}`);
+    }
   }
 
-  private mergeEntitySql(restoreDeleted = true): string {
-    const source = restoreDeleted ? 'VALUES (?, ?, ?, ?, ?)' : `SELECT ?, ?, ?, ?, ?
-      WHERE NOT EXISTS (SELECT 1 FROM deleted_entities WHERE name = ?)`;
-    return `INSERT INTO entities(name, entity_type, observations, created_at, updated_at) ${source}
+  private async syncCentral(direction: 'push' | 'pull'): Promise<CentralSyncResult> {
+    const projectPath = resolve(this.sqliteManager.getDatabasesPath(), 'memory.db');
+    await this.ensureProjectSchema();
+    await this.ensureCentralSchema();
+    await this.sqliteManager.ensureSchemaVersion(this.centralDbPath);
+    const stats: CentralSyncResult = {
+      entities: 0,
+      relations: 0,
+      deleted: { project: 0, central: 0 },
+      skipped: { entities: 0, relations: 0 },
+    };
+    if (fs.realpathSync(projectPath) === fs.realpathSync(this.centralDbPath)) return stats;
+
+    const source = direction === 'push' ? 'main' : 'central';
+    const target = direction === 'push' ? 'central' : 'main';
+    return this.sqliteManager.withAttachedTransaction(projectPath, this.centralDbPath, async tx => {
+      const entities = (await tx.query(`SELECT * FROM ${source}.entities ORDER BY updated_at DESC LIMIT 10000`))
+        .map(row => this.rowToEntity(row));
+      const relations = (await tx.query(`SELECT * FROM ${source}.relations LIMIT 10000`))
+        .map(row => this.rowToRelation(row));
+
+      // Carry tombstones first so a stale copy in either store cannot win the merge.
+      await tx.run('INSERT OR IGNORE INTO central.deleted_entities SELECT name FROM main.deleted_entities');
+      await tx.run('INSERT OR IGNORE INTO main.deleted_entities SELECT name FROM central.deleted_entities');
+      const deleted = new Set((await tx.query('SELECT name FROM central.deleted_entities LIMIT -1'))
+        .map(row => z.string().parse(row.name)));
+      if (deleted.size > 0) {
+        stats.deleted.project = await this.purgeDeletedEntities(tx, 'main');
+        stats.deleted.central = await this.purgeDeletedEntities(tx, 'central');
+      }
+
+      const aliases = new Map<string, string>();
+      if (direction === 'pull') {
+        for (const value of await tx.query('SELECT alias, canonical_name FROM main.entity_aliases LIMIT -1')) {
+          const row = memoryRowSchemas.entity_aliases.parse(value);
+          aliases.set(row.alias, row.canonical_name);
+        }
+      }
+      const syncedNames: string[] = [];
+      const mergeEntity = this.mergeEntitySql(target);
+      for (const entity of entities) {
+        const name = aliases.get(entity.name) ?? entity.name;
+        if (deleted.has(entity.name) || deleted.has(name)) {
+          stats.skipped.entities++;
+          continue;
+        }
+        const observations = this.cleanObservations(entity, relations);
+        stats.entities += await tx.run(mergeEntity,
+          [name, entity.entityType, JSON.stringify(observations), entity.createdAt, entity.updatedAt]);
+        syncedNames.push(name);
+      }
+      for (const relation of relations) {
+        const from = aliases.get(relation.from) ?? relation.from;
+        const to = aliases.get(relation.to) ?? relation.to;
+        if ([relation.from, relation.to, from, to].some(name => deleted.has(name))) {
+          stats.skipped.relations++;
+          continue;
+        }
+        stats.relations += await tx.run(
+          `INSERT OR IGNORE INTO ${target}.relations (from_entity, to_entity, relation_type, created_at) VALUES (?, ?, ?, ?)`,
+          [from, to, relation.relationType, relation.createdAt]);
+      }
+      if (direction === 'push' && syncedNames.length > 0) {
+        await tx.run(`INSERT OR REPLACE INTO central.observation_provenance
+          (entity_name, observation, source, retrieved_at, confidence, freshness)
+          SELECT entity_name, observation, source, retrieved_at, confidence, freshness
+          FROM main.observation_provenance WHERE entity_name IN (SELECT value FROM json_each(?))`,
+        [JSON.stringify(syncedNames)]);
+      }
+      return stats;
+    });
+  }
+
+  private async purgeDeletedEntities(tx: AttachedTransaction, store: 'main' | 'central'): Promise<number> {
+    const deleted = `SELECT name FROM ${store}.deleted_entities`;
+    await tx.run(`DELETE FROM ${store}.relations WHERE from_entity IN (${deleted}) OR to_entity IN (${deleted})`);
+    await tx.run(`DELETE FROM ${store}.observation_provenance WHERE entity_name IN (${deleted})`);
+    if ((await tx.query(`SELECT 1 FROM ${store}.sqlite_schema WHERE name = 'vec_entities'`)).length > 0) {
+      await tx.run(`DELETE FROM ${store}.vec_entities
+        WHERE rowid IN (SELECT rowid FROM ${store}.entities WHERE name IN (${deleted}))`);
+    }
+    return tx.run(`DELETE FROM ${store}.entities WHERE name IN (${deleted})`);
+  }
+
+  private mergeEntitySql(target: 'main' | 'central'): string {
+    return `INSERT INTO ${target}.entities(name, entity_type, observations, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(name) DO UPDATE SET
         entity_type = CASE WHEN excluded.updated_at > entities.updated_at THEN excluded.entity_type ELSE entities.entity_type END,
         observations = (SELECT json_group_array(value) FROM (
@@ -722,8 +730,9 @@ export class MemoryManager {
     }
   }
 
-  async initializeMemoryDatabase(): Promise<void> {
-    // Note: Database will be created automatically when first accessed
+  async initializeMemoryDatabase({ projectOnly = false } = {}): Promise<void> {
+    await this.ensureProjectSchema();
+    if (projectOnly) return;
     const manageProjectFiles = process.env.NODE_ENV !== 'test';
 
     const targetRoot = this.targetRoot;
@@ -735,8 +744,6 @@ export class MemoryManager {
     } catch (err) {
       console.warn('Central memory initialization failed:', err);
     }
-
-    await this.ensureProjectSchema();
 
     // Scattered DB consolidation — DESTRUCTIVE (merges nested memory.db files
     // into the root and deletes them, destroying per-project isolation).
@@ -777,8 +784,6 @@ export class MemoryManager {
         console.warn('Scattered DB scan failed:', e);
       }
     }
-
-    await this.syncToCentralSafe();
   }
 
   private isJunkEntity(name: string, observations: string[]): boolean {
@@ -793,9 +798,18 @@ export class MemoryManager {
   }
 
   async createEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
+    const entity = await this.writeEntity(name, entityType, observations, provenance);
+    await this.syncToCentralSafe();
+    return entity;
+  }
+
+  private async writeEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     if (this.isJunkEntity(name, observations)) {
       throw new Error(`Refusing to create junk/test entity: ${name}`);
+    }
+    if ((await this.readTombstones(this.centralDbPath, name)).length > 0) {
+      throw new Error(`Entity '${name}' was deleted from central memory`);
     }
     const now = new Date().toISOString();
 
@@ -838,9 +852,6 @@ export class MemoryManager {
       updatedAt: now,
     }, entityRelations);
 
-    // Auto-sync to central (best-effort)
-    await this.syncToCentralSafe();
-
     return {
       name,
       entityType,
@@ -855,11 +866,12 @@ export class MemoryManager {
     const results: Entity[] = [];
     this.lastCreateFailures = [];
     // single transaction for batch — avoids N fsyncs
-    await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN TRANSACTION');
+    const begin = await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN IMMEDIATE');
+    if (!begin.success) throw new Error(begin.error);
     try {
       for (const entity of entities) {
         try {
-          const created = await this.createEntity(entity.name, entity.entityType, entity.observations, entity.provenance);
+          const created = await this.writeEntity(entity.name, entity.entityType, entity.observations, entity.provenance);
           results.push(created);
         } catch (error) {
           this.lastCreateFailures.push({
@@ -869,7 +881,8 @@ export class MemoryManager {
           console.error(`Failed to create entity ${entity.name}:`, error);
         }
       }
-      await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      const commit = await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      if (!commit.success) throw new Error(commit.error);
     } catch (e) {
       try { await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK'); } catch (e) { void e; }
       throw e;
@@ -885,6 +898,12 @@ export class MemoryManager {
   }
 
   async createRelation(from: string, to: string, relationType: string): Promise<Relation> {
+    const relation = await this.writeRelation(from, to, relationType);
+    await this.syncToCentralSafe();
+    return relation;
+  }
+
+  private async writeRelation(from: string, to: string, relationType: string): Promise<Relation> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     // Verify entities exist
     const fromEntity = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name: from });
@@ -934,8 +953,6 @@ export class MemoryManager {
       }
     } catch (e) { void e; }
 
-    await this.syncToCentralSafe();
-
     return {
       from,
       to,
@@ -964,6 +981,7 @@ export class MemoryManager {
     if (!parsed) return;
     if (this.isJunkEntity(parsed.name, parsed.observations)) return;
     const { name } = parsed;
+    if ((await this.readTombstones(this.centralDbPath, name)).length > 0) return;
     const relations = await this.getRelationsForEntity(name);
     let entityType = parsed.entityType;
     let observations = this.cleanObservations({ ...parsed, createdAt: '', updatedAt: '' }, relations)
@@ -1161,17 +1179,19 @@ export class MemoryManager {
   async createRelations(relations: Array<{ from: string; to: string; relationType: string }>): Promise<Relation[]> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const results: Relation[] = [];
-    await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN TRANSACTION');
+    const begin = await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN IMMEDIATE');
+    if (!begin.success) throw new Error(begin.error);
     try {
       for (const relation of relations) {
         try {
-          const created = await this.createRelation(relation.from, relation.to, relation.relationType);
+          const created = await this.writeRelation(relation.from, relation.to, relation.relationType);
           results.push(created);
         } catch (error) {
           console.error(`Failed to create relation ${relation.from} -> ${relation.to}:`, error);
         }
       }
-      await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      const commit = await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      if (!commit.success) throw new Error(commit.error);
     } catch (e) {
       try { await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK'); } catch (e) { void e; }
       throw e;
@@ -1182,6 +1202,12 @@ export class MemoryManager {
   }
 
   async addObservation(entityName: string, contents: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
+    const entity = await this.writeObservation(entityName, contents, provenance);
+    await this.syncToCentralSafe();
+    return entity;
+  }
+
+  private async writeObservation(entityName: string, contents: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     // Get current entity
     const result = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name: entityName });
@@ -1222,8 +1248,6 @@ export class MemoryManager {
       updatedAt: now,
     }, updatedRelations);
 
-    await this.syncToCentralSafe();
-
     return {
       name: entity.name,
       entityType: entity.entity_type,
@@ -1236,17 +1260,19 @@ export class MemoryManager {
   async addObservations(observations: Array<{ entityName: string; contents: string[]; provenance?: Array<ObservationProvenance | undefined> }>): Promise<Entity[]> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const results: Entity[] = [];
-    await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN TRANSACTION');
+    const begin = await this.sqliteManager.executeSql(this.memoryDbName, 'BEGIN IMMEDIATE');
+    if (!begin.success) throw new Error(begin.error);
     try {
       for (const obs of observations) {
         try {
-          const updated = await this.addObservation(obs.entityName, obs.contents, obs.provenance);
+          const updated = await this.writeObservation(obs.entityName, obs.contents, obs.provenance);
           results.push(updated);
         } catch (error) {
           console.error(`Failed to add observations to entity ${obs.entityName}:`, error);
         }
       }
-      await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      const commit = await this.sqliteManager.executeSql(this.memoryDbName, 'COMMIT');
+      if (!commit.success) throw new Error(commit.error);
     } catch (e) {
       try { await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK'); } catch (e) { void e; }
       throw e;
@@ -1417,46 +1443,60 @@ export class MemoryManager {
     const edges = [...relations.values()];
     return { entities: [...entities.values()].map(entity => ({ ...entity, observations: this.cleanObservations(entity, edges) })), relations: edges };
   }
+  private async readTombstones(database: string, name?: string): Promise<string[]> {
+    if (database === this.centralDbPath && !fs.existsSync(database)) return [];
+    const result = name === undefined
+      ? await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities LIMIT -1')
+      : await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities WHERE name = ?', [name]);
+    if (!result.success) {
+      // A legacy or empty store may not have been opened by a sync yet.
+      const schema = await this.sqliteManager.executeSql(database,
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'deleted_entities'");
+      if (schema.success && schema.data?.rows?.length === 0) return [];
+      throw new Error(result.error || 'Could not read entity deletions');
+    }
+    return (result.data?.rows ?? []).map(row => z.string().parse(row.name));
+  }
 
-  async readStore(database: string, opts?: { limit?: number; offset?: number }): Promise<KnowledgeGraph> {
+  private async readDeletedNames(name?: string): Promise<Set<string>> {
+    const [project, central] = await Promise.all([
+      this.readTombstones(this.memoryDbName, name),
+      this.readTombstones(this.centralDbPath, name),
+    ]);
+    return new Set([...project, ...central]);
+  }
+
+  async readStore(
+    database: string,
+    opts?: { limit?: number; offset?: number },
+    deletedNames: Set<string> = new Set(),
+  ): Promise<KnowledgeGraph> {
     const limit = opts?.limit ?? 5000;
-    const offset = opts?.offset;
-    const entitiesResult = await this.sqliteManager.queryData(database, 'entities', {}, limit, offset, 'updated_at', 'DESC');
-    const relationsResult = await this.sqliteManager.queryData(database, 'relations', {}, limit, offset);
-    const relations: Relation[] = (relationsResult.success && relationsResult.data)
-        ? relationsResult.data.rows.map(row => this.rowToRelation(row))
-        : [];
-    const entities: Entity[] = (entitiesResult.success && entitiesResult.data)
-      ? entitiesResult.data.rows.map(row => this.rowToEntity(row)) : [];
+    const offset = opts?.offset ?? 0;
+    if (!Number.isInteger(limit) || limit < 0 || !Number.isInteger(offset) || offset < 0) {
+      return { entities: [], relations: [] };
+    }
+    const excluded = JSON.stringify([...deletedNames]);
+    const [entitiesResult, relationsResult] = await Promise.all([
+      this.sqliteManager.executeSql(database, `SELECT * FROM entities
+        WHERE name NOT IN (SELECT value FROM json_each(?)) ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+      [excluded, limit, offset]),
+      this.sqliteManager.executeSql(database, `SELECT * FROM relations
+        WHERE from_entity NOT IN (SELECT value FROM json_each(?))
+          AND to_entity NOT IN (SELECT value FROM json_each(?)) LIMIT ? OFFSET ?`,
+      [excluded, excluded, limit, offset]),
+    ]);
+    const relations = (relationsResult.data?.rows ?? []).map(row => this.rowToRelation(row));
+    const entities = (entitiesResult.data?.rows ?? []).map(row => this.rowToEntity(row));
     return { entities: entities.map(entity => ({ ...entity, observations: this.cleanObservations(entity, relations) })), relations };
   }
 
-  async readGraph(opts?: { limit?: number; offset?: number }): Promise<KnowledgeGraph> {
-    const limit = opts?.limit ?? 5000;
-    const offset = opts?.offset;
-    const projectResult = await this.sqliteManager.queryData(this.memoryDbName, 'entities', {}, limit, offset, 'updated_at', 'DESC');
-    const projectRelations = await this.sqliteManager.queryData(this.memoryDbName, 'relations', {}, limit, offset);
-    const centralResult = await this.sqliteManager.queryData(this.centralDbPath, 'entities', {}, limit, offset, 'updated_at', 'DESC');
-    const centralRelations = await this.sqliteManager.queryData(this.centralDbPath, 'relations', {}, limit, offset);
-
-    return this.mergeGraphs([
-      {
-        entities: (projectResult.success && projectResult.data)
-          ? projectResult.data.rows.map(row => this.rowToEntity(row))
-          : [],
-        relations: (projectRelations.success && projectRelations.data)
-          ? projectRelations.data.rows.map(row => this.rowToRelation(row))
-          : []
-      },
-      {
-        entities: (centralResult.success && centralResult.data)
-          ? centralResult.data.rows.map(row => this.rowToEntity(row))
-          : [],
-        relations: (centralRelations.success && centralRelations.data)
-          ? centralRelations.data.rows.map(row => this.rowToRelation(row))
-          : []
-      }
-    ]);
+  async readGraph(opts?: { limit?: number; offset?: number; scope?: 'project' | 'merged' }): Promise<KnowledgeGraph> {
+    const deleted = await this.readDeletedNames();
+    const project = await this.readStore(this.memoryDbName, opts, deleted);
+    if (opts?.scope === 'project') return project;
+    const central = await this.readStore(this.centralDbPath, opts, deleted);
+    return this.mergeGraphs([project, central]);
   }
 
   async vacuumDatabases(): Promise<void> {
@@ -1476,12 +1516,15 @@ export class MemoryManager {
       } catch (e) { void e; }
     }
     // Use updated_at DESC, name ASC as tie-breaker
-    const whereClause = decoded ? `WHERE (updated_at < ? OR (updated_at = ? AND name > ?))` : '';
-    const params: unknown[] = decoded ? [decoded.updated_at, decoded.updated_at, decoded.name] : [];
-    const projSql = `SELECT * FROM entities ${whereClause} ORDER BY updated_at DESC, name ASC LIMIT ${capped + 1}`;
+    const deleted = await this.readDeletedNames();
+    const cursorFilter = decoded ? 'AND (updated_at < ? OR (updated_at = ? AND name > ?))' : '';
+    const params: unknown[] = [JSON.stringify([...deleted])];
+    if (decoded) params.push(decoded.updated_at, decoded.updated_at, decoded.name);
+    const pageSql = `SELECT * FROM entities WHERE name NOT IN (SELECT value FROM json_each(?))
+      ${cursorFilter} ORDER BY updated_at DESC, name ASC LIMIT ${capped + 1}`;
     const [projRes, centRes] = await Promise.all([
-      this.sqliteManager.executeSql(this.memoryDbName, projSql, params),
-      this.sqliteManager.executeSql(this.centralDbPath, projSql, params),
+      this.sqliteManager.executeSql(this.memoryDbName, pageSql, params),
+      this.sqliteManager.executeSql(this.centralDbPath, pageSql, params),
     ]);
     const toEnts = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToEntity(row)) : [];
     const merged = this.mergeGraphs([{ entities: toEnts(projRes), relations: [] }, { entities: toEnts(centRes), relations: [] }]);
@@ -1499,8 +1542,10 @@ export class MemoryManager {
     let relations: Relation[] = [];
     if (names.length > 0) {
       const placeholders = names.map(() => '?').join(',');
-      const relSql = `SELECT * FROM relations WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders}) LIMIT ${capped * 2}`;
-      const relParams = [...names, ...names];
+      const relSql = `SELECT * FROM relations WHERE (from_entity IN (${placeholders}) OR to_entity IN (${placeholders}))
+        AND from_entity NOT IN (SELECT value FROM json_each(?))
+        AND to_entity NOT IN (SELECT value FROM json_each(?)) LIMIT ${capped * 2}`;
+      const relParams = [...names, ...names, params[0], params[0]];
       const [pr, cr] = await Promise.all([
         this.sqliteManager.executeSql(this.memoryDbName, relSql, relParams),
         this.sqliteManager.executeSql(this.centralDbPath, relSql, relParams),
@@ -1541,20 +1586,18 @@ export class MemoryManager {
       this.sqliteManager.executeSql(this.centralDbPath, relationsQuery, [searchTerm, searchTerm, searchTerm])
     ]);
     const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
-    const central = toRels(cr).filter(relation => !deletedNames.has(relation.from) && !deletedNames.has(relation.to));
-    return [...toRels(pr), ...central];
+    return [...toRels(pr), ...toRels(cr)].filter(relation => isLiveRelation(relation, deletedNames));
   }
 
   async searchNodes(query: string, limit: number = 20, mode: string = 'keyword', detailLevel: string = 'full'): Promise<SearchResult> {
     const cappedLimit = Math.min(Math.max(limit, 1), 100);
     const effMode = (mode as string) || 'keyword';
-    const deletions = await this.sqliteManager.executeSql(this.memoryDbName, 'SELECT name FROM deleted_entities');
-    const deletedNames = new Set((deletions.data?.rows ?? []).map(row => z.string().parse(row.name)));
+    const deletedNames = await this.readDeletedNames();
     const excludedNames = deletedNames.size > 0 ? JSON.stringify([...deletedNames]) : undefined;
     let rawResult: SearchResult;
     if (effMode === 'vector') {
       const [p, c] = await Promise.all([
-        this.vecSearchDb(this.memoryDbName, query, cappedLimit),
+        this.vecSearchDb(this.memoryDbName, query, cappedLimit, excludedNames),
         this.vecSearchDb(this.centralDbPath, query, cappedLimit, excludedNames)
       ]);
       const rels = await this.searchRelationsBoth(query, deletedNames);
@@ -1562,7 +1605,7 @@ export class MemoryManager {
     } else if (effMode === 'hybrid') {
       // FTS + vector RRF
       const fts = await this.searchNodes(query, cappedLimit, 'keyword', 'full');
-      const vecP = await this.vecSearchDb(this.memoryDbName, query, cappedLimit);
+      const vecP = await this.vecSearchDb(this.memoryDbName, query, cappedLimit, excludedNames);
       const vecC = await this.vecSearchDb(this.centralDbPath, query, cappedLimit, excludedNames);
       const vecEntities = [...vecP, ...vecC];
       // RRF k=60
@@ -1598,12 +1641,13 @@ export class MemoryManager {
         JOIN entities_fts fts ON e.rowid = fts.rowid
         WHERE entities_fts MATCH ?`;
       const orderAndLimit = ` ORDER BY bm25(entities_fts) LIMIT ${cappedLimit}`;
-      const centralQuery = excludedNames
+      const visibleQuery = excludedNames
         ? `${entitiesQuery} AND e.name NOT IN (SELECT value FROM json_each(?))${orderAndLimit}`
         : entitiesQuery + orderAndLimit;
+      const params = excludedNames ? [sanitizedQuery, excludedNames] : [sanitizedQuery];
       const [projectEntities, centralEntities, relations] = await Promise.all([
-        this.sqliteManager.executeSql(this.memoryDbName, entitiesQuery + orderAndLimit, [sanitizedQuery]),
-        this.sqliteManager.executeSql(this.centralDbPath, centralQuery, excludedNames ? [sanitizedQuery, excludedNames] : [sanitizedQuery]),
+        this.sqliteManager.executeSql(this.memoryDbName, visibleQuery, params),
+        this.sqliteManager.executeSql(this.centralDbPath, visibleQuery, params),
         this.searchRelationsBoth(query, deletedNames)
       ]);
 
@@ -1648,11 +1692,9 @@ export class MemoryManager {
   }
 
   async openNode(name: string): Promise<Entity | null> {
+    if ((await this.readDeletedNames(name)).has(name)) return null;
     const result = await this.sqliteManager.queryData(this.memoryDbName, 'entities', { name });
     if (!result.success || !result.data || result.data.rows.length === 0) {
-      const deletion = await this.sqliteManager.executeSql(this.memoryDbName,
-        'SELECT name FROM deleted_entities WHERE name = ?', [name]);
-      if (deletion.data?.rows?.length) return null;
       const centralResult = await this.sqliteManager.queryData(this.centralDbPath, 'entities', { name });
       if (!centralResult.success || !centralResult.data || centralResult.data.rows.length === 0) {
         return null;
@@ -1713,7 +1755,8 @@ export class MemoryManager {
     ]);
 
     const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
-    const allRelations: Relation[] = [...toRels(pRel), ...toRels(cRel)];
+    const deleted = await this.readDeletedNames();
+    const allRelations = [...toRels(pRel), ...toRels(cRel)].filter(relation => isLiveRelation(relation, deleted));
     const uniqueRelations = allRelations.filter((r, idx, arr) =>
       arr.findIndex(x => x.from === r.from && x.to === r.to && x.relationType === r.relationType) === idx
     );
@@ -1744,8 +1787,10 @@ export class MemoryManager {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
 
-    let sql = 'SELECT name, entity_type, observations, created_at, updated_at FROM entities WHERE 1=1';
-    const params: unknown[] = [];
+    const deleted = await this.readDeletedNames();
+    let sql = `SELECT name, entity_type, observations, created_at, updated_at FROM entities
+      WHERE name NOT IN (SELECT value FROM json_each(?))`;
+    const params: unknown[] = [JSON.stringify([...deleted])];
 
     if (options.entityType) {
       sql += ' AND entity_type = ?';

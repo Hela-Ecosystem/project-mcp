@@ -188,7 +188,7 @@ export class RequestHandlers {
     this.memoryManager.setTargetRoot(workspaceRoot);
     this.runtimeCapabilities?.setWorkspaceRoot(workspaceRoot);
     this.importExportManager.setWorkspaceRoot(workspaceRoot);
-    await this.memoryManager.initializeMemoryDatabase();
+    await this.memoryManager.initializeMemoryDatabase({ projectOnly: true });
 
     return {
       projectRoot: workspaceRoot,
@@ -401,12 +401,9 @@ export class RequestHandlers {
 
       case 'read_graph': {
         const args = toolSchemas.read_graph.parse(input);
-        const database = args.database;
-        if (database) {
-          const g = await this.memoryManager.readStore(database === 'central' ? this.memoryManager.getCentralDatabaseId() : 'memory', { limit: args.limit, offset: args.offset });
-          return { success: true, data: g };
-        }
-        const graph = await this.memoryManager.readGraph({ limit: args.limit, offset: args.offset });
+        const graph = args.database === 'central'
+          ? await this.memoryManager.readStore(this.memoryManager.getCentralDatabaseId(), args)
+          : await this.memoryManager.readGraph({ ...args, scope: args.database === 'project' ? 'project' : 'merged' });
         return { success: true, data: graph };
       }
 

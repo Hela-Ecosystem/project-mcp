@@ -22,6 +22,11 @@ type BackupDatabase = sqlite3.Database & {
   backup(path: string, callback: (error: Error | null) => void): SQLiteBackup;
 };
 
+export interface AttachedTransaction {
+  query: (sql: string, params?: unknown[]) => Promise<DatabaseRow[]>;
+  run: (sql: string, params?: unknown[]) => Promise<number>;
+}
+
 export class SQLiteManager {
   private connections: Map<string, sqlite3.Database> = new Map();
   private databasesPath: string;
@@ -110,6 +115,11 @@ export class SQLiteManager {
     } catch (error) {
       console.warn('SQLite performance pragmas failed:', error);
     }
+    await this.loadVectorExtension(db, name);
+    return db;
+  }
+
+  private async loadVectorExtension(db: sqlite3.Database, name: string): Promise<void> {
     // Vector extension — best-effort, for vec0 KNN (Jest's import.meta.resolve fails, so use createRequire fallback)
     try {
       const { createRequire } = await import('module');
@@ -133,7 +143,30 @@ export class SQLiteManager {
         console.warn('[vec] load failed for', name, (e2 as Error).message);
       }
     }
-    return db;
+  }
+
+  async withAttachedTransaction<T>(database: string, centralDatabase: string, work: (transaction: AttachedTransaction) => Promise<T>): Promise<T> {
+    // An isolated connection keeps unrelated tool calls out of the sync transaction.
+    const db = new sqlite3.Database(this.getDatabasePath(database), sqlite3.OPEN_READWRITE);
+    try {
+      await this.runQuery(db, 'PRAGMA busy_timeout=5000');
+      await this.loadVectorExtension(db, database);
+      await this.runQuery(db, 'ATTACH DATABASE ? AS central', [this.getDatabasePath(centralDatabase)]);
+      await this.runQuery(db, 'BEGIN IMMEDIATE');
+      try {
+        const result = await work({
+          query: async (sql, params) => (await this.query(db, sql, params)).rows,
+          run: async (sql, params) => (await this.runQuery(db, sql, params)).changes,
+        });
+        await this.runQuery(db, 'COMMIT');
+        return result;
+      } catch (error) {
+        await this.runQuery(db, 'ROLLBACK').catch(() => {});
+        throw error;
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => db.close(error => error ? reject(error) : resolve()));
+    }
   }
 
   async createDatabase(name: string): Promise<DatabaseOperationResult<{ name: string; path: string }>> {
