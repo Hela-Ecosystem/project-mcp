@@ -277,8 +277,10 @@ export const ReadGraphStreamSchema = z.object({
 
 export const ReadGraphSchema = z.object({
   database: z.enum(['project', 'central']).optional(),
-  limit: z.number().int().min(1).max(10000).optional(),
-  offset: z.number().int().min(0).optional(),
+  /** Opaque cursor from a previous page; merged scope uses the stream cursor. */
+  cursor: z.string().optional(),
+  limit: z.number().int().min(1).max(1000).default(500).optional(),
+  offset: z.number().int().min(0).default(0).optional(),
 });
 
 export const OpenNodeSchema = z.object({
@@ -305,10 +307,12 @@ export const GetSessionContextSchema = z.object({
 
 export const AnalyzeGitChangesSchema = z.object({
   commit: SafeRevisionSchema.optional(),
-  since: SafeRevisionSchema.default('1'),
+  // "0" diffs HEAD against the working tree: uncommitted changes, the common
+  // review target. "N" is N commits ago; a date is resolved with rev-list.
+  since: SafeRevisionSchema.default('0'),
   includeUntracked: z.boolean().default(true),
   maxFiles: z.number().int().min(1).max(500).default(100),
-}).strict().refine(value => !(value.commit && value.since !== '1'), {
+}).strict().refine(value => !(value.commit && value.since !== '0'), {
   message: 'commit and since are mutually exclusive',
 });
 

@@ -310,12 +310,13 @@ Remove relationships between project entities (supports single or batch).
   - `relationType`: Relationship type to delete
 
 #### `read_graph` - Read Project Knowledge Graph
-Retrieve the full knowledge graph, merging the active project database with the central aggregate. Project entries win over central entries with the same name. Supports pagination.
+Retrieve one bounded page of the knowledge graph, merging the active project database with the central aggregate. Project entries win over central entries with the same name. Follow `nextCursor` until it is absent.
 
 **Parameters:**
 - `database` (optional): Omit to merge both stores. Use `"project"` or `"central"` to read one store.
-- `limit` (optional, 1-10000, default 5000): Max entities/relations to return, `ORDER BY updated_at DESC`
-- `offset` (optional, 0+): Rows to skip
+- `cursor` (optional): `nextCursor` from the previous page. Opaque; request the same scope.
+- `limit` (optional, 1-1000, default 500): Max entities and relations per page
+- `offset` (optional, 0+): Rows to skip for single-store reads
 
 #### `search_nodes` - Search Project Knowledge (Hybrid RAG & Progressive Disclosure)
 Search for entities and relations matching a query across names, types, and content, using SQLite FTS5 (BM25) and local vector embeddings with Reciprocal Rank Fusion (RRF $k=60$). Supports progressive disclosure to prevent token bloat.
@@ -439,10 +440,10 @@ Summarize active tasks, open bugs, recent changes, blockers, and the next sugges
 - `scope` (optional, default `project`): Use `merged` to include central memory.
 
 #### `analyze_git_changes`
-Return exact machine-readable changed paths from Git, including renames and optionally untracked files.
+Return exact machine-readable changed paths from Git, including renames and optionally untracked files. Root commits and one-commit repositories diff against Git's empty tree instead of failing on `HEAD~N`.
 
 - `commit` (optional): Analyze one commit against its parent.
-- `since` (optional, default `1`): Analyze changes since N commits ago or a Git date.
+- `since` (optional, default `0`): `"0"` diffs the working tree against `HEAD` (uncommitted changes); `"N"` analyzes changes since N commits ago; a Git date is resolved with `rev-list --before`.
 - `includeUntracked` (optional, default `true`): Include untracked files for worktree analysis.
 - `maxFiles` (optional, 1-500, default 100): Bound returned paths.
 - `commit` and a custom `since` value are mutually exclusive.
@@ -454,7 +455,7 @@ Normalize up to 256 KiB of untrusted text and detect hidden formatting, instruct
 - Detection is heuristic. Returned normalized text remains untrusted data.
 
 #### `scan_project_secrets`
-Scan a workspace-relative file or directory for likely hardcoded credentials. Results contain only type, relative file path, and line number; matched values are never returned.
+Scan a workspace-relative file or directory for likely hardcoded credentials. Results contain only type, relative file path, and line number; matched values are never returned. Finding types come from the shared redaction pattern table (`aws_access_key`, `github_pat`, `key_value_secret`, `private_key`, and so on).
 
 - `path` (optional, default `.`): Workspace-relative scan target.
 - `exclude` (optional): Additional directory names to skip.
@@ -892,7 +893,7 @@ The server reads these variables at startup:
 | `REDIS_URL` | unset | Enables the Redis-backed `cache_*` tools |
 | `XDG_DATA_HOME` | platform default | Base directory for the shared fallback database outside a Git repository |
 | `HELA_GENOME_ALLOW_SQL_WRITE` | *unset = off* | Set to `true` to allow `execute_sql` writes. Read-only `SELECT`/`WITH`/`VALUES`/`EXPLAIN` and whitelisted `PRAGMA` reads always allowed. |
-| `HELA_GENOME_ALLOW_DESTRUCTIVE` | *unset = off* | Set to `true` to allow `delete_data` and `setup_pre_commit` (Git hook install). |
+| `HELA_GENOME_ALLOW_DESTRUCTIVE` | *unset = off* | Set to `true` to allow raw mutating data tools (`insert_data`, `update_data`, `delete_data`, `import_data`) and `setup_pre_commit` (Git hook install). |
 | `HELA_GENOME_ALLOW_EXTERNAL_PATHS` | *unset = off* | Set to `true` to let `import_data`/`export_data` use absolute or traversal paths outside the active project root. Off = paths must stay inside the workspace. |
 | `HELA_ENVELOPE` | *unset = off* | Set to `true` to wrap tool results in the canonical HeLaResult envelope (`ok/summary/data/artifacts/provenance/warnings/sideEffects/execution`). Off = byte-identical legacy output. Run/step ids propagate from `HELA_RUN_ID`/`HELA_STEP_ID`. |
 

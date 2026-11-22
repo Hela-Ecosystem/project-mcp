@@ -23,7 +23,7 @@ import * as path from 'path';
 import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
-import { isAbsolute, resolve, basename, dirname, join as joinPath } from 'path';
+import { isAbsolute, resolve, basename, dirname, join as joinPath, relative } from 'path';
 import { createInterface } from 'readline';
 
 const execAsync = promisify(exec);
@@ -49,6 +49,76 @@ interface CentralSyncResult {
 
 function isLiveRelation(relation: Relation, deleted: Set<string>): boolean {
   return !deleted.has(relation.from) && !deleted.has(relation.to);
+}
+
+/**
+ * Pre-commit hook that merges nested memory.db files into the root store.
+ * Every step is chained with `&&`, so a failed merge never removes the nested
+ * database; observations are merged (not ignored); and successful files are
+ * moved aside instead of deleted. `find` is restricted to source trees so it
+ * cannot descend into dependencies, vendored repos, build output, or backups
+ * (project-mcp#40).
+ */
+export const AUTO_COMBINE_HOOK_ENTRY =
+  'bash -c \'find . -mindepth 2 -type f -name memory.db ' +
+  '-not -path "*/.git/*" -not -path "*/node_modules/*" -not -path "*/vendor/*" ' +
+  '-not -path "*/venv/*" -not -path "*/.venv/*" -not -path "*/dist/*" -not -path "*/build/*" ' +
+  '-not -path "*/target/*" -not -path "*/backups/*" -not -path "*/.guardian-merged/*" ' +
+  '-print | while IFS= read -r db; do ' +
+  'sqlite3 memory.db "ATTACH DATABASE \\"$db\\" AS nested; ' +
+  'UPDATE entities SET observations = (SELECT json_group_array(value) FROM (SELECT value FROM json_each(entities.observations) UNION SELECT value FROM json_each(COALESCE((SELECT observations FROM nested.entities WHERE name = entities.name), json_array())))) WHERE name IN (SELECT name FROM nested.entities); ' +
+  'INSERT INTO entities(name, entity_type, observations, created_at, updated_at) SELECT name, entity_type, observations, created_at, updated_at FROM nested.entities WHERE name NOT IN (SELECT name FROM entities); ' +
+  'INSERT OR IGNORE INTO relations(from_entity, to_entity, relation_type, created_at) SELECT from_entity, to_entity, relation_type, created_at FROM nested.relations; ' +
+  'DETACH DATABASE nested;" ' +
+  '&& mkdir -p .guardian-merged ' +
+  '&& mv "$db" ".guardian-merged/$(echo "$db" | sed "s|^\\./||; s|/|__|g")"; ' +
+  'done\'';
+
+export function buildPreCommitConfig({ hasPython, hasNode }: { hasPython: boolean; hasNode: boolean }): string {
+  const repos = [`  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: detect-private-key`];
+
+  if (hasPython) {
+    repos.push(`  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        args: [--line-length=100]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.0
+    hooks:
+      - id: ruff
+        args: [--fix]`);
+  }
+
+  if (hasNode) {
+    repos.push(`  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        types_or: [javascript, jsx, ts, tsx, css, less, html, json, markdown]`);
+  }
+
+  repos.push(`  - repo: local
+    hooks:
+      - id: project-guardian-auto-combine
+        name: Auto-combine scattered memory.db files
+        entry: >
+            ${AUTO_COMBINE_HOOK_ENTRY}
+        language: system
+        always_run: true
+        pass_filenames: false`);
+
+  return `repos:\n${repos.join('\n\n')}\n`;
 }
 
 export class MemoryManager {
@@ -654,50 +724,7 @@ export class MemoryManager {
                           fs.existsSync(path.join(targetRoot, 'setup.py'));
         const hasNode = fs.existsSync(path.join(targetRoot, 'package.json'));
 
-        const repos = [`  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
-    hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-added-large-files
-        args: [--maxkb=500]
-      - id: check-merge-conflict
-      - id: detect-private-key`];
-
-        if (hasPython) {
-          repos.push(`  - repo: https://github.com/psf/black
-    rev: 24.4.2
-    hooks:
-      - id: black
-        args: [--line-length=100]
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.0
-    hooks:
-      - id: ruff
-        args: [--fix]`);
-        }
-
-        if (hasNode) {
-          repos.push(`  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v3.1.0
-    hooks:
-      - id: prettier
-        types_or: [javascript, jsx, ts, tsx, css, less, html, json, markdown]`);
-        }
-
-        repos.push(`  - repo: local
-    hooks:
-      - id: project-guardian-auto-combine
-        name: Auto-combine scattered memory.db files
-        entry: >
-            bash -c 'find . -mindepth 2 -type f -name memory.db | while read db; do sqlite3 memory.db "ATTACH DATABASE \\"$db\\" AS nested; INSERT OR IGNORE INTO entities SELECT * FROM nested.entities; INSERT OR IGNORE INTO relations SELECT * FROM nested.relations;"; rm "$db"; done'
-        language: system
-        always_run: true
-        pass_filenames: false`);
-
-        const preCommitContent = `repos:\n${repos.join('\n\n')}\n`;
+        const preCommitContent = buildPreCommitConfig({ hasPython, hasNode });
         fs.writeFileSync(preCommitConfigPath, preCommitContent, 'utf8');
         const ac = new AbortController();
         const timeoutId = setTimeout(() => ac.abort(), 30000);
@@ -716,6 +743,7 @@ export class MemoryManager {
       const guardianEntries = [
         'memory.db',
         'memory.db-journal',
+        '.guardian-merged/',
         '.claude/',
         '.vscode/',
         '.idea/',
@@ -1743,10 +1771,24 @@ export class MemoryManager {
   async getFileContext(filePath: string): Promise<FileContextResult> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const cleanPath = filePath.replace(/^\.\//, '').trim();
-    const candidateNames = [
-      cleanPath.startsWith('file:') ? cleanPath : `file:${cleanPath}`,
-      cleanPath,
-    ];
+    // File entities are stored relative to the workspace (sometimes its
+    // parent, e.g. `file:hela-runtime/src/manifest.ts`). Normalise absolute
+    // paths to both stored forms instead of missing the entity (project-mcp#40).
+    const paths = new Set<string>([cleanPath]);
+    const workspaceName = basename(this.targetRoot);
+    if (workspaceName && !cleanPath.startsWith(`${workspaceName}/`) && !cleanPath.startsWith('file:')) {
+      // Stored names may be relative to the workspace parent.
+      paths.add(`${workspaceName}/${cleanPath.replace(/^\.\//, '')}`);
+    }
+    if (isAbsolute(cleanPath)) {
+      const fromRoot = relative(this.targetRoot, cleanPath);
+      if (fromRoot && !fromRoot.startsWith('..') && !isAbsolute(fromRoot)) paths.add(fromRoot);
+      const fromParent = relative(dirname(this.targetRoot), cleanPath);
+      if (fromParent && !fromParent.startsWith('..') && !isAbsolute(fromParent)) paths.add(fromParent);
+    }
+    const candidateNames = [...paths]
+      .map(candidate => candidate.replace(/^\.\//, ''))
+      .flatMap(candidate => candidate.startsWith('file:') ? [candidate] : [`file:${candidate}`, candidate]);
 
     let entity: Entity | null = null;
     let foundName = candidateNames[0];

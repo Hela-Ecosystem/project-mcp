@@ -350,6 +350,10 @@ Track all code review activities for audit and improvement!`;
   private generateBugTrackingPrompt(args: Record<string, string | undefined>): string {
     const bugDesc = args.bug_description || 'Software Bug';
     const severity = args.severity_level || 'Medium';
+    // `get_session_context` finds open bugs by `entityType === 'bug'`, so the
+    // guide must file bugs the same way the rest of the repo does
+    // (project-mcp#40).
+    const slug = bugDesc.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'untitled';
 
     return `# Bug Tracking Guide for "${bugDesc}"
 
@@ -363,8 +367,8 @@ Track and manage ${severity} severity bug.
 await memory_edit({
   action: "create_entities",
   entities: [{
-    name: "bug_${Date.now()}",
-    entityType: "risk",
+    name: "bug:${slug}",
+    entityType: "bug",
     observations: [
       "${bugDesc}",
       "Severity: ${severity}",
@@ -376,6 +380,10 @@ await memory_edit({
   }]
 });
 \`\`\`
+
+Bug entities use the \`bug:<slug>\` name and \`entityType: "bug"\` so
+\`get_session_context\` lists them under \`openBugs\`. Add \`[FIX]\` or
+\`[RESOLVED]\` observations to close a bug.
 
 ### 2. Link to Affected Components
 Connect bug to impacted features/tasks.

@@ -11,9 +11,28 @@ import {
   GetSessionContextInput, InspectUntrustedTextInput, ScanContainerImageInput, ScanProjectSecretsInput,
 } from '../types.js';
 import { PathGuard } from './path-guard.js';
+import { SECRET_PATTERNS as SHARED_SECRET_PATTERNS } from '../session-bridge/redact.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_SECRET_FILE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Line-scannable view of the shared redaction table (project-mcp#40), plus the
+ * credential shapes that were already scanner-only. Global flags are stripped
+ * so `.test()` on each line stays stateless; the multi-line private-key block
+ * is replaced by its header so a single line still matches.
+ */
+const withoutGlobalFlag = (pattern: RegExp): RegExp =>
+  new RegExp(pattern.source, pattern.flags.replace('g', ''));
+
+export const SECRET_SCAN_PATTERNS: Array<[string, RegExp]> = [
+  ...SHARED_SECRET_PATTERNS
+    .filter(({ name }) => name !== 'private_key')
+    .map(({ name, pattern }) => [name, withoutGlobalFlag(pattern)] as [string, RegExp]),
+  ['private_key', /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/],
+  ['google_api_key', /AIza[0-9A-Za-z_-]{35}/],
+  ['slack_webhook', /https:\/\/hooks\.slack\.com\/services\/T[a-zA-Z0-9_]{8}\/B[a-zA-Z0-9_]{8}\/[a-zA-Z0-9_]{24}/],
+];
 
 /**
  * SQLite keeps its WAL locking in `-shm`, and POSIX releases *every* lock the
@@ -27,12 +46,6 @@ const SQLITE_ARTIFACT_RE = /(?:\.db|\.sqlite|\.sqlite3)(?:-(?:wal|shm|journal))?
 export function isSqliteArtifact(fileName: string): boolean {
   return SQLITE_ARTIFACT_RE.test(fileName) || SQLITE_ARTIFACT_RE.test(fileName.split(/[\\/]/).pop() ?? '');
 }
-const SECRET_PATTERNS: Array<[string, RegExp]> = [
-  ['Generic API Key', /(?:key|api|token|secret|auth|password|pwd)\s*[:=]\s*['"]?([a-zA-Z0-9_-]{16,})/i],
-  ['Google API Key', /AIza[0-9A-Za-z_-]{35}/],
-  ['Slack Webhook', /https:\/\/hooks\.slack\.com\/services\/T[a-zA-Z0-9_]{8}\/B[a-zA-Z0-9_]{8}\/[a-zA-Z0-9_]{24}/],
-  ['Private Key', /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/],
-];
 const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   ['instruction_override', /\b(?:ignore|disregard|forget)\s+(?:(?:all|any)\s+)?(?:previous|prior|above|earlier|system)\s+(?:instructions?|messages?|rules?|prompts?)\b/i],
   ['system_override', /\b(?:system\s+override|administrative\s+access|disable\s+(?:all\s+)?(?:filters?|safety|guardrails?))\b/i],
@@ -41,6 +54,9 @@ const INJECTION_PATTERNS: Array<[string, RegExp]> = [
   ['hidden_content', /(?:display\s*:\s*none|font-size\s*:\s*0|visibility\s*:\s*hidden|color\s*:\s*transparent)/i],
   ['remote_exfiltration', /(?:!\[[^\]]*\]\(https?:\/\/|<img\b[^>]*\bsrc\s*=\s*["']?https?:\/\/)/i],
 ];
+
+/** Git's magic empty tree; the base for a root commit or a one-commit repo. */
+export const GIT_EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 export class RuntimeCapabilities {
   private redis?: RedisClientType;
@@ -75,16 +91,22 @@ export class RuntimeCapabilities {
   }
 
   async analyzeGitChanges(input: AnalyzeGitChangesInput) {
-    const base = input.commit ? `${input.commit}^` : input.since.match(/^\d+$/) ? `HEAD~${input.since}` : await this.git(['rev-list', '-1', `--before=${input.since}`, 'HEAD']);
-    if (!base) throw new Error(`No commit found before ${input.since}`);
     const target = input.commit ?? undefined;
+    let base: string;
+    if (target) base = `${target}^`;
+    else if (/^\d+$/.test(input.since)) base = `HEAD~${input.since}`;
+    else base = await this.git(['rev-list', '-1', `--before=${input.since}`, 'HEAD']);
+    if (!base) throw new Error(`No commit found before ${input.since}`);
+    // A one-commit repo has no HEAD~1 (and the root commit has no parent):
+    // diff the empty tree instead of failing, so committed and untracked
+    // files are still reported (project-mcp#40).
+    if (!(await this.revExists(base))) base = GIT_EMPTY_TREE;
     let output: string;
     try {
       output = await this.git(['diff', '--name-status', '-z', base, ...(target ? [target] : [])]);
     } catch (error) {
-      if (!input.commit) throw error;
-      const empty = await this.git(['hash-object', '-t', 'tree', '/dev/null']);
-      output = await this.git(['diff', '--name-status', '-z', empty, input.commit]);
+      if (!target) throw error;
+      output = await this.git(['diff', '--name-status', '-z', GIT_EMPTY_TREE, target]);
     }
     const files = this.parseNameStatus(output);
     if (input.includeUntracked && !input.commit) {
@@ -128,7 +150,7 @@ export class RuntimeCapabilities {
         const lines = (await readFile(file, 'utf8')).split(/\r?\n/);
         lines.forEach((line, index) => {
           if (findings.length >= input.maxFindings) { truncated = true; return; }
-          for (const [type, pattern] of SECRET_PATTERNS) {
+          for (const [type, pattern] of SECRET_SCAN_PATTERNS) {
             if (pattern.test(line)) findings.push({ type, file: this.pathGuard.toRelativePath(file), line: index + 1 });
           }
         });
@@ -180,6 +202,15 @@ export class RuntimeCapabilities {
   private async git(args: string[]): Promise<string> {
     const { stdout } = await execFileAsync('git', args, { cwd: this.pathGuard.getRoot(), timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
     return stdout.trim();
+  }
+
+  private async revExists(rev: string): Promise<boolean> {
+    try {
+      await execFileAsync('git', ['rev-parse', '--verify', '--quiet', rev], { cwd: this.pathGuard.getRoot(), timeout: 5000 });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private parseNameStatus(output: string): Array<{ path: string; status: string; oldPath?: string }> {

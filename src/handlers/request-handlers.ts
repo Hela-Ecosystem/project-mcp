@@ -201,9 +201,7 @@ export class RequestHandlers {
       case 'set_project_root': return this.setProjectRoot(toolSchemas.set_project_root.parse(input));
       case 'setup_pre_commit':
         // P0-A7: installs git hooks into the project root — opt-in host mutation.
-        if (process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] !== 'true') {
-          throw new Error('setup_pre_commit is disabled (set HELA_GENOME_ALLOW_DESTRUCTIVE=true to enable)');
-        }
+        this.requireDestructive('setup_pre_commit');
         await this.memoryManager.setupProjectFiles(); return { message: 'Pre-commit configuration installed in the active project root' };
       case 'sync_central_memory': return this.memoryManager.syncToCentral();
       case 'get_session_context': return this.runtimeCapabilities!.getSessionContext(toolSchemas.get_session_context.parse(input));
@@ -246,6 +244,17 @@ export class RequestHandlers {
     return selector === 'central' ? this.memoryManager.getCentralDatabaseId() : 'memory';
   }
 
+  /**
+   * Bulk writes can overwrite or delete memory content, so every mutating raw
+   * data tool shares one opt-in gate (project-mcp#40). Read-only tools and
+   * append-only `memory_edit` stay open.
+   */
+  private requireDestructive(tool: string): void {
+    if (process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] !== 'true') {
+      throw new Error(`${tool} is disabled (set HELA_GENOME_ALLOW_DESTRUCTIVE=true to enable)`);
+    }
+  }
+
   private async handleDatabaseTool(name: string, input: unknown): Promise<unknown> {
     switch (name) {
       case 'execute_sql': {
@@ -276,12 +285,14 @@ export class RequestHandlers {
       case 'insert_data': {
         const args = toolSchemas.insert_data.parse(input);
         const database = this.resolveDatabase(args.database);
+        this.requireDestructive('insert_data');
         return await this.sqliteManager.insertData(database, args.table, args.records);
 
       }
       case 'update_data': {
         const args = toolSchemas.update_data.parse(input);
         const database = this.resolveDatabase(args.database);
+        this.requireDestructive('update_data');
         return await this.sqliteManager.updateData(database, args.table, args.conditions, args.updates);
 
       }
@@ -289,15 +300,14 @@ export class RequestHandlers {
         const args = toolSchemas.delete_data.parse(input);
         const database = this.resolveDatabase(args.database);
         // P0-A7: bulk delete is destructive — opt-in.
-        if (process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] !== 'true') {
-          throw new Error('delete_data is disabled (set HELA_GENOME_ALLOW_DESTRUCTIVE=true to enable)');
-        }
+        this.requireDestructive('delete_data');
         return await this.sqliteManager.deleteData(database, args.table, args.conditions);
 
       }
       case 'import_data': {
         const args = toolSchemas.import_data.parse(input);
         const database = this.resolveDatabase(args.database);
+        this.requireDestructive('import_data');
         return await this.importExportManager.importFromFile(
           database,
           args.table,
@@ -401,10 +411,37 @@ export class RequestHandlers {
 
       case 'read_graph': {
         const args = toolSchemas.read_graph.parse(input);
+        const limit = args.limit ?? 500;
+        let offset = args.offset ?? 0;
+        // Merged scope uses the stream's keyset cursor so a page never has to
+        // materialise the whole graph (project-mcp#40). Single-store reads stay
+        // offset-based and expose an offset cursor.
+        if (!args.database) {
+          if (offset > 0) throw new Error('offset is only supported for single-store reads; use cursor for merged scope');
+          return { success: true, data: await this.memoryManager.readGraphStream(args.cursor, limit) };
+        }
+        if (args.cursor) {
+          try {
+            offset = z.object({ offset: z.number().int().min(0) })
+              .parse(JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf8'))).offset;
+          } catch {
+            throw new Error('Invalid read_graph cursor for a single-store read');
+          }
+        }
         const graph = args.database === 'central'
-          ? await this.memoryManager.readStore(this.memoryManager.getCentralDatabaseId(), args)
-          : await this.memoryManager.readGraph({ ...args, scope: args.database === 'project' ? 'project' : 'merged' });
-        return { success: true, data: graph };
+          ? await this.memoryManager.readStore(this.memoryManager.getCentralDatabaseId(), { limit: limit + 1, offset })
+          : await this.memoryManager.readGraph({ limit: limit + 1, offset, scope: 'project' });
+        const hasMore = graph.entities.length > limit;
+        return {
+          success: true,
+          data: {
+            entities: graph.entities.slice(0, limit),
+            relations: graph.relations.slice(0, limit),
+            ...(hasMore
+              ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + limit })).toString('base64url') }
+              : {}),
+          },
+        };
       }
 
       case 'read_graph_stream': {

@@ -571,6 +571,8 @@ export class SQLiteManager {
       const table = this.assertSafeIdentifier(tableName, 'table name');
       this.assertSafeColumns(updates, 'update column');
       this.assertSafeColumns(conditions, 'condition column');
+      if (!updates || Object.keys(updates).length === 0) throw new Error('updates must contain at least one column');
+      if (!conditions || Object.keys(conditions).length === 0) throw new Error('conditions must contain at least one column; refusing an unbounded update');
       
       const setClause = Object.keys(updates).map(key => `${key} = ?`).join(', ');
       const whereClause = Object.keys(conditions).map(key => `${key} = ?`).join(' AND ');
@@ -602,6 +604,7 @@ export class SQLiteManager {
       const db = await this.getConnection(database);
       const table = this.assertSafeIdentifier(tableName, 'table name');
       this.assertSafeColumns(conditions, 'condition column');
+      if (!conditions || Object.keys(conditions).length === 0) throw new Error('conditions must contain at least one column; refusing an unbounded delete');
       
       const whereClause = Object.keys(conditions).map(key => `${key} = ?`).join(' AND ');
       const sql = `DELETE FROM ${table} WHERE ${whereClause}`;

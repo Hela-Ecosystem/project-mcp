@@ -42,7 +42,7 @@ describe('RuntimeCapabilities', () => {
 
     const result = await runtime.scanProjectSecrets({ path: '.', exclude: [], maxFindings: 10 });
 
-    expect(result.findings).toEqual([{ type: 'Generic API Key', file: 'config.txt', line: 1 }]);
+    expect(result.findings).toEqual([{ type: 'key_value_secret', file: 'config.txt', line: 1 }]);
     expect(JSON.stringify(result)).not.toContain(secret);
     expect(result.complete).toBe(true);
   });

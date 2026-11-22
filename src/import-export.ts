@@ -365,8 +365,14 @@ export class ImportExportManager {
     for (const row of rows) {
       const values = columns.map(col => {
         const value = row[col];
-        if (typeof value === 'string' && (value.includes(delimiter) || value.includes('"'))) {
-          return `"${value.replace(/"/g, '""')}"`;
+        if (typeof value === 'string') {
+          // Spreadsheet formula injection: memory content comes from web pages
+          // and transcripts, so neutralise cells a spreadsheet would execute.
+          const neutralized = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+          if (neutralized.includes(delimiter) || neutralized.includes('"')) {
+            return `"${neutralized.replace(/"/g, '""')}"`;
+          }
+          return neutralized;
         }
         return value ?? '';
       });

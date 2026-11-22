@@ -6,7 +6,7 @@
  * and additionally report WHICH pattern families fired, filling the
  * `HelaRedaction { applied, fields[] }` shape on stored session observations.
  */
-const NAMED_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+export const NAMED_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: 'private_tag', pattern: /<private>[\s\S]*?<\/private>|<!--\s*private\s*-->[\s\S]*?<!--\s*\/private\s*-->/gi },
   { name: 'openai_key', pattern: /sk-(or|proj|ant|live|test)-[A-Za-z0-9_-]{8,}/g },
   { name: 'sk_key', pattern: /sk-[A-Za-z0-9]{16,}/g },
@@ -17,9 +17,17 @@ const NAMED_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: 'aws_access_key', pattern: /AKIA[0-9A-Z]{16}/g },
   { name: 'private_key', pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g },
   { name: 'jwt', pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
-  { name: 'key_value_secret', pattern: /(api[_-]?key|apikey|auth[_-]?token|access[_-]?token|secret|password|passwd|pwd)\s*[:=]\s*['"]?[^\s'"]{4,}['"]?/gi },
+  { name: 'key_value_secret', pattern: /\b(api[_-]?key|apikey|auth[_-]?token|access[_-]?token|key|token|secret|password|passwd|pwd)\b\s*[:=]\s*['"]?[^\s'"]{4,}['"]?/gi },
   { name: 'bearer_token', pattern: /Bearer\s+[A-Za-z0-9_.\-~+/=]{12,}/g },
 ];
+
+/**
+ * Credential patterns for scanners. `private_tag` is a redaction directive,
+ * not a leaked secret, so it is excluded. Each entry carries the finding name
+ * that `security_scan` reports (project-mcp#40).
+ */
+export const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> =
+  NAMED_PATTERNS.filter(({ name }) => name !== 'private_tag');
 
 export interface RedactionMeta {
   applied: boolean;

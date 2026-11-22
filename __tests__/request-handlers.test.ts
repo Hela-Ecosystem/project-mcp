@@ -117,41 +117,51 @@ describe('RequestHandlers', () => {
     });
 
     test('should handle insert_data tool', async () => {
-      // Create test table
-      const schema = {
-        columns: [
-          { name: 'id', type: 'INTEGER', constraints: ['PRIMARY KEY'] },
-          { name: 'name', type: 'TEXT' }
-        ]
-      };
-      await sqliteManager.createTable('memory', 'test_table', schema);
+      process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] = 'true';
+      try {
+        // Create test table
+        const schema = {
+          columns: [
+            { name: 'id', type: 'INTEGER', constraints: ['PRIMARY KEY'] },
+            { name: 'name', type: 'TEXT' }
+          ]
+        };
+        await sqliteManager.createTable('memory', 'test_table', schema);
 
-      const result = await requestHandlers.handleToolCall('insert_data', {
-        table: 'test_table',
-        records: [{ id: 1, name: 'Test' }]
-      });
+        const result = await requestHandlers.handleToolCall('insert_data', {
+          table: 'test_table',
+          records: [{ id: 1, name: 'Test' }]
+        });
 
-      expect(result).toHaveProperty('success', true);
+        expect(result).toHaveProperty('success', true);
+      } finally {
+        delete process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'];
+      }
     });
 
     test('should handle update_data tool', async () => {
-      // Create test table and insert data
-      const schema = {
-        columns: [
-          { name: 'id', type: 'INTEGER', constraints: ['PRIMARY KEY'] },
-          { name: 'name', type: 'TEXT' }
-        ]
-      };
-      await sqliteManager.createTable('memory', 'test_table', schema);
-      await sqliteManager.insertData('memory', 'test_table', [{ id: 1, name: 'Test' }]);
+      process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'] = 'true';
+      try {
+        // Create test table and insert data
+        const schema = {
+          columns: [
+            { name: 'id', type: 'INTEGER', constraints: ['PRIMARY KEY'] },
+            { name: 'name', type: 'TEXT' }
+          ]
+        };
+        await sqliteManager.createTable('memory', 'test_table', schema);
+        await sqliteManager.insertData('memory', 'test_table', [{ id: 1, name: 'Test' }]);
 
-      const result = await requestHandlers.handleToolCall('update_data', {
-        table: 'test_table',
-        conditions: { id: 1 },
-        updates: { name: 'Updated Test' }
-      });
+        const result = await requestHandlers.handleToolCall('update_data', {
+          table: 'test_table',
+          conditions: { id: 1 },
+          updates: { name: 'Updated Test' }
+        });
 
-      expect(result).toHaveProperty('success', true);
+        expect(result).toHaveProperty('success', true);
+      } finally {
+        delete process.env['HELA_GENOME_ALLOW_DESTRUCTIVE'];
+      }
     });
 
     test('should handle delete_data tool', async () => {

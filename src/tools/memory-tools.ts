@@ -95,10 +95,15 @@ export const memoryTools: Tool[] = [
   },
   {
     name: 'read_graph',
-    description: 'Read the entire project knowledge graph',
+    description: 'Read one bounded page of the project knowledge graph (default 500 entities). Follow nextCursor for more; use read_graph_stream for keyset streaming.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        database: { type: 'string', enum: ['project', 'central'], description: 'Omit to merge both stores' },
+        cursor: { type: 'string', description: 'nextCursor from the previous page; opaque and scoped to the selected database' },
+        limit: { type: 'integer', minimum: 1, maximum: 1000, default: 500, description: 'Max entities and relations per page' },
+        offset: { type: 'integer', minimum: 0, default: 0, description: 'Rows to skip for single-store reads' },
+      },
     },
   },
   {
