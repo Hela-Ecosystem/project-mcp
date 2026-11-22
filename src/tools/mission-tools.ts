@@ -1,4 +1,5 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { MISSION_CLAIM_LEASE_MINUTES } from '../types.js';
 
 export const missionTools: Tool[] = [
   {
@@ -37,14 +38,15 @@ export const missionTools: Tool[] = [
   },
   {
     name: 'update_mission',
-    description: 'Update mission status or results. Claim queued missions exclusively with claimedBy (status claimed or in_progress); existing claims cannot be reassigned.',
+    description: `Claim a queued mission or reclaim an expired claim with status "claimed" and claimedBy. Claims are exclusive and expire ${MISSION_CLAIM_LEASE_MINUTES} minutes after claimedAt. The current claimant can move a live claim to in_progress, then completed or failed. Cancel from any state, naming the claimant for an active claim. Operators can use action "requeue" to reset a mission and clear its claim and outcome.`,
     inputSchema: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Mission ID to update' },
-        status: { type: 'string', enum: ['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled'], description: 'New mission status' },
-        claimedBy: { type: 'string', minLength: 1, maxLength: 100, pattern: '\\S', description: 'Agent exclusively claiming a queued mission; omit for subsequent lifecycle updates' },
-        result: { type: 'object', description: 'Output data or result report upon completion' },
+        action: { type: 'string', enum: ['requeue'], description: 'Reset any mission to queued. Omit status, claimedBy, result, and error.' },
+        status: { type: 'string', enum: ['claimed', 'in_progress', 'completed', 'failed', 'cancelled'], description: 'New mission status. Defaults to claimed when only claimedBy is supplied.' },
+        claimedBy: { type: 'string', minLength: 1, maxLength: 100, pattern: '\\S', description: 'New claimant when claiming. Current claimant when starting, completing, failing, or cancelling an active claim.' },
+        result: { description: 'JSON output. Required and non-null for completed. Optional for failed.' },
         error: { type: 'string', description: 'Error message if mission failed' },
         database: { type: 'string', enum: ['project', 'central'], default: 'project', description: 'Target database (project or central)' }
       },

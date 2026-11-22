@@ -1,7 +1,7 @@
 import { ingestFeedbackSpool } from './feedback-spool.js';
 import { AttachedTransaction, SQLiteManager } from './sqlite-manager.js';
 import { Entity, Relation, KnowledgeGraph, SearchResult, CompactEntity, FileContextResult, TimelineResult, TimelineEntry, Mission, CreateMissionInput, ListMissionsInput, UpdateMissionInput } from './types.js';
-import { DatabaseRow, DatabaseOperationResult, SqlExecutionData, memoryRowSchemas } from './types.js';
+import { DatabaseRow, DatabaseOperationResult, SqlExecutionData, MISSION_CLAIM_LEASE_MINUTES, UpdateMissionSchema, memoryRowSchemas } from './types.js';
 import { z } from 'zod';
 import { ObsidianVaultMirror, uniqueObservations, observationHash } from './obsidian-vault.js';
 import { createHash } from 'crypto';
@@ -28,6 +28,16 @@ import { createInterface } from 'readline';
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const MAX_CENTRAL_BACKUPS = 7;
+
+const missionRowSchema = z.object({
+  id: z.string(), title: z.string(), description: z.string().nullable(),
+  origin_agent: z.string(), target_agent: z.string(),
+  status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']),
+  priority: z.enum(['low', 'normal', 'high', 'urgent']),
+  payload: z.string().nullable(), result: z.string().nullable(), error: z.string().nullable(),
+  claimed_by: z.string().nullable(), claimed_at: z.string().nullable(), completed_at: z.string().nullable(),
+  created_at: z.string(), updated_at: z.string(),
+});
 
 interface CentralSyncResult {
   entities: number;
@@ -1936,86 +1946,118 @@ export class MemoryManager {
   }
 
   async updateMission(input: UpdateMissionInput, dbSelector: 'project' | 'central' = 'project'): Promise<Mission> {
-    const isClaim = input.claimedBy !== undefined;
-    if (isClaim && (typeof input.claimedBy !== 'string' || !input.claimedBy.trim() || input.claimedBy.trim().length > 100)) {
-      throw new Error('Failed to update mission: claimedBy must be a non-empty string of at most 100 characters');
+    const parsed = UpdateMissionSchema.safeParse(input);
+    if (!parsed.success) {
+      const reason = parsed.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join(', ');
+      throw new Error(`Failed to update mission: ${reason}`);
     }
-    if (input.status === 'claimed' && !isClaim) {
-      throw new Error('Failed to update mission: claimed status requires claimedBy');
-    }
-    if (isClaim && input.status !== undefined && input.status !== 'claimed' && input.status !== 'in_progress') {
-      throw new Error('Failed to update mission: claims require claimed or in_progress status');
-    }
+    const { id, action, claimedBy, result, error } = parsed.data;
     const dbTarget = dbSelector === 'central' ? this.centralDbPath : this.memoryDbName;
     await this.ensureMissionsSchema(dbTarget);
 
-    const now = new Date().toISOString();
-    const updates: string[] = ['updated_at = ?'];
-    const params: unknown[] = [now];
+    const selected = await this.sqliteManager.executeSql(dbTarget, 'SELECT * FROM missions WHERE id = ?', [id]);
+    if (!selected.success) throw new Error(`Failed to update mission: ${selected.error}`);
+    const stored = selected.data?.rows?.[0];
+    if (!stored) throw new Error(`Mission not found: ${id}`);
 
-    if (input.status !== undefined) {
-      updates.push('status = ?');
-      params.push(input.status);
-      if (input.status === 'completed' || input.status === 'failed' || input.status === 'cancelled') {
-        updates.push('completed_at = ?');
-        params.push(now);
+    const current = missionRowSchema.parse(stored);
+    const status = action === 'requeue' ? 'queued' : parsed.data.status ?? (claimedBy ? 'claimed' : undefined);
+    if (!status) throw new Error('Failed to update mission: specify status, claimedBy, or action: requeue');
+    if (status === 'queued' && action !== 'requeue') {
+      throw new Error('Failed to update mission: use action: requeue to return a mission to queued');
+    }
+    if (result !== undefined && status !== 'completed' && status !== 'failed') {
+      throw new Error('Failed to update mission: result is only allowed on completion or failure');
+    }
+    if (error !== undefined && status !== 'failed') {
+      throw new Error('Failed to update mission: error is only allowed on failure');
+    }
+
+    const now = new Date();
+    const timestamp = now.toISOString();
+    const active = current.status === 'claimed' || current.status === 'in_progress';
+    const claimStarted = Date.parse(current.claimed_at ?? '');
+    const hasClaim = Boolean(current.claimed_by?.trim()) && Number.isFinite(claimStarted);
+    const expired = hasClaim && now.getTime() - claimStarted >= MISSION_CLAIM_LEASE_MINUTES * 60_000;
+    const unavailable = `Failed to update mission: mission is not available for claiming: ${id}`;
+    const next = { ...current };
+
+    if (status === 'queued' || status === 'claimed') {
+      const cleanQueue = current.status === 'queued' && current.claimed_by === null && current.claimed_at === null
+        && current.completed_at === null && current.result === null && current.error === null;
+      if (status === 'claimed' && !cleanQueue && !(active && expired)) {
+        throw new Error(unavailable);
       }
-    }
-
-    if (input.claimedBy !== undefined) {
-      updates.push('claimed_by = ?');
-      params.push(input.claimedBy.trim());
-      updates.push('claimed_at = ?');
-      params.push(now);
-      if (!input.status) {
-        updates.push('status = ?');
-        params.push('claimed');
+      next.claimed_by = claimedBy ?? null;
+      next.claimed_at = claimedBy ? timestamp : null;
+      next.completed_at = null;
+      next.result = null;
+      next.error = null;
+    } else if (status === 'cancelled') {
+      if (active && current.claimed_by && !claimedBy) {
+        throw new Error('Failed to update mission: cancelling an active claim requires claimedBy');
       }
+      if (claimedBy && claimedBy !== current.claimed_by) {
+        throw new Error('Failed to update mission: claimedBy does not match the current claimant');
+      }
+      if (!hasClaim) {
+        next.claimed_by = null;
+        next.claimed_at = null;
+      }
+      next.completed_at = timestamp;
+    } else {
+      if (!claimedBy) throw new Error(`Failed to update mission: ${status} requires claimedBy`);
+      const requiredStatus = status === 'in_progress' ? 'claimed' : 'in_progress';
+      if (current.status !== requiredStatus) {
+        throw new Error(`Failed to update mission: cannot transition from ${current.status} to ${status}`);
+      }
+      if (claimedBy !== current.claimed_by) {
+        throw new Error('Failed to update mission: claimedBy does not match the current claimant');
+      }
+      if (!hasClaim) throw new Error('Failed to update mission: claim has no valid timestamp, use action: requeue');
+      if (expired) throw new Error('Failed to update mission: claim lease has expired, claim the mission again');
+
+      let serializedResult: string | undefined;
+      if (result !== undefined) {
+        try {
+          serializedResult = JSON.stringify(result);
+        } catch {
+          throw new Error('Failed to update mission: result must be JSON serializable');
+        }
+        if (serializedResult === undefined) throw new Error('Failed to update mission: result must be JSON serializable');
+      }
+      if (status === 'completed' && (serializedResult === undefined || serializedResult === 'null')) {
+        throw new Error('Failed to update mission: completed status requires a result');
+      }
+      next.completed_at = status === 'in_progress' ? null : timestamp;
+      next.result = serializedResult ?? null;
+      next.error = error ?? null;
     }
 
-    if (input.result !== undefined) {
-      updates.push('result = ?');
-      params.push(JSON.stringify(input.result));
-    }
-
-    if (input.error !== undefined) {
-      updates.push('error = ?');
-      params.push(input.error);
-    }
-
-    params.push(input.id);
-
+    // Compare the stored claim and status in the write so concurrent updates cannot overwrite a newer transition.
     const updateRes = await this.sqliteManager.executeSql(
       dbTarget,
-      `UPDATE missions SET ${updates.join(', ')} WHERE id = ?${isClaim ? " AND status = 'queued' AND claimed_by IS NULL AND claimed_at IS NULL" : ''}`,
-      params
+      `WITH previous AS (
+        SELECT id FROM missions
+        WHERE id = ? AND status = ? AND claimed_by IS ? AND claimed_at IS ? AND updated_at = ?
+      )
+      UPDATE missions
+      SET status = ?, claimed_by = ?, claimed_at = ?, completed_at = ?, result = ?, error = ?, updated_at = ?
+      WHERE id IN (SELECT id FROM previous)
+      RETURNING *`,
+      [id, current.status, current.claimed_by, current.claimed_at, current.updated_at,
+        status, next.claimed_by, next.claimed_at, next.completed_at, next.result, next.error, timestamp]
     );
 
-    if (!updateRes.success) {
-      throw new Error(`Failed to update mission: ${updateRes.error}`);
-    }
+    if (!updateRes.success) throw new Error(`Failed to update mission: ${updateRes.error}`);
+    const updated = updateRes.data?.rows?.[0];
+    if (!updated) throw new Error(status === 'claimed' ? unavailable : 'Failed to update mission: mission changed concurrently, retry the update');
 
-    const rows = await this.sqliteManager.executeSql(dbTarget, `SELECT * FROM missions WHERE id = ?`, [input.id]);
-    if (!rows.success || !rows.data?.rows?.length) {
-      throw new Error(`Mission not found: ${input.id}`);
-    }
-    if (isClaim && updateRes.data?.changes !== 1) {
-      throw new Error(`Failed to update mission: mission is not available for claiming: ${input.id}`);
-    }
-
-    return this.mapMissionRow(rows.data.rows[0]);
+    return this.mapMissionRow(updated);
   }
 
   private mapMissionRow(value: DatabaseRow): Mission {
-    const row = z.object({
-      id: z.string(), title: z.string(), description: z.string().nullable(),
-      origin_agent: z.string(), target_agent: z.string(),
-      status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']),
-      priority: z.enum(['low', 'normal', 'high', 'urgent']),
-      payload: z.string().nullable(), result: z.string().nullable(), error: z.string().nullable(),
-      claimed_by: z.string().nullable(), claimed_at: z.string().nullable(), completed_at: z.string().nullable(),
-      created_at: z.string(), updated_at: z.string(),
-    }).parse(value);
+    const row = missionRowSchema.parse(value);
     let payload: unknown = undefined;
     if (row.payload) {
       try { payload = JSON.parse(row.payload); } catch { payload = row.payload; }

@@ -402,14 +402,17 @@ Query missions from the ledger filtered by status, agent target, origin, or clai
 - `database` (optional, default: `project`): `project` | `central`
 
 #### `update_mission`
-Claim a queued, unowned mission or report its lifecycle progress (e.g. marking `completed` with output results, or `failed` with an error message). Automatically records timestamps (`claimed_at`, `completed_at`, `updated_at`). A claim uses one conditional SQL update; competing claimants receive an error rather than replacing the winner.
+Missions follow `queued → claimed → in_progress → completed | failed`. Each transition on an active claim requires the current claimant's name. A claim expires 30 minutes after `claimedAt`, including while the mission is in progress. Starting a mission keeps the original timestamp. After expiry, any agent can claim the mission, which sets a fresh timestamp and returns it to `claimed`. Competing claim requests have a single winner.
+
+Set `status: "cancelled"` from any state and include `claimedBy` if the mission has an active claimant. An operator can set `action: "requeue"` from any state to return the mission to `queued` and clear `claimedBy`, `claimedAt`, `completedAt`, `result`, and `error`. Use this action to repair older queued missions with stale claim fields.
 
 **Parameters:**
 - `id` (required): Mission ID to update
-- `status` (optional): New status
-- `claimedBy` (optional): Non-empty agent name, up to 100 characters. Supplying it attempts an exclusive claim, optionally with `status: claimed` or `status: in_progress`. Do not repeat it on subsequent lifecycle updates; claimant reassignment and claimant-free `status: claimed` are rejected.
-- `result` (optional): JSON result or return value upon completion
-- `error` (optional): Error message if mission failed
+- `action` accepts `"requeue"`. Supply only `id` and optionally `database` with this action.
+- `status` accepts `claimed`, `in_progress`, `completed`, `failed`, or `cancelled`. Supplying only `claimedBy` with the mission ID defaults to `claimed`.
+- `claimedBy` is a non-empty agent name up to 100 characters. Supply the new claimant when claiming and the current claimant when starting, completing, failing, or cancelling an active claim.
+- `result` is a JSON value. Required and non-null for `completed`, optional for `failed`.
+- `error` is an optional error message for `failed`.
 - `database` (optional, default: `project`): `project` | `central`
 
 ### Runtime Companion Tools

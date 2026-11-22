@@ -6,7 +6,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { MemoryManager } from '../src/memory-manager';
 import { SQLiteManager } from '../src/sqlite-manager';
-import { UpdateMissionInput } from '../src/types';
+import { MISSION_CLAIM_LEASE_MINUTES, UpdateMissionInput } from '../src/types';
 
 describe('Exclusive mission claims', () => {
   let root: string;
@@ -63,27 +63,64 @@ describe('Exclusive mission claims', () => {
     await expect(memory.updateMission({ id: 'missing', status: 'completed' })).rejects.toThrow('Mission not found: missing');
   });
 
-  test('never reassigns a claim, including after completion or requeueing', async () => {
-    const memory = manager();
-    const mission = await memory.createMission({ title: 'Keep claim owner' });
-    const claimed = await memory.updateMission({ id: mission.id, status: 'in_progress', claimedBy: ' worker ' });
-    expect(claimed.claimedBy).toBe('worker');
-    for (const status of ['in_progress', 'completed', 'queued'] as const) {
-      const before = await memory.updateMission({ id: mission.id, status, result: { status } });
+  test.each(['claimed', 'in_progress'] as const)(
+    'can reclaim an expired %s mission and rejects updates from the previous claimant',
+    async status => {
+      const memory = manager();
+      const { id } = await memory.createMission({ title: 'Reclaim expired mission' });
+      const claimed = await memory.updateMission({ id, claimedBy: ' worker ' });
+      expect(claimed.claimedBy).toBe('worker');
+      if (status === 'in_progress') await memory.updateMission({ id, status, claimedBy: 'worker' });
+
       for (const claimedBy of ['worker', 'other']) {
-        await expect(memory.updateMission({ id: mission.id, claimedBy, result: { overwritten: true }, error: 'overwrite' })).rejects.toThrow('not available for claiming');
-        expect((await memory.listMissions({ id: mission.id }))[0]).toEqual(before);
+        await expect(memory.updateMission({ id, claimedBy })).rejects.toThrow('not available for claiming');
       }
-      expect(before.claimedAt).toBe(claimed.claimedAt);
-    }
+      const expiredClaimedAt = await ageClaim(id);
+      const transition = status === 'claimed' ? { status: 'in_progress' as const } : { status: 'failed' as const };
+      await expect(memory.updateMission({ id, claimedBy: 'worker', ...transition })).rejects.toThrow('lease has expired');
+
+      const reclaimed = await memory.updateMission({ id, claimedBy: 'other' });
+      expect(reclaimed).toMatchObject({ status: 'claimed', claimedBy: 'other' });
+      expect(Date.parse(reclaimed.claimedAt ?? '')).toBeGreaterThan(Date.parse(expiredClaimedAt));
+      await expect(memory.updateMission({ id, status: 'in_progress', claimedBy: 'worker' })).rejects.toThrow('does not match');
+      await expect(memory.updateMission({ id, status: 'in_progress', claimedBy: 'other' })).resolves.toMatchObject({
+        status: 'in_progress', claimedBy: 'other', claimedAt: reclaimed.claimedAt,
+      });
+    },
+  );
+
+  async function ageClaim(id: string): Promise<string> {
+    const expiredAt = new Date(Date.now() - MISSION_CLAIM_LEASE_MINUTES * 60_000 - 1000).toISOString();
+    const update = await connections[0].executeSql('memory', 'UPDATE missions SET claimed_at = ? WHERE id = ?', [expiredAt, id]);
+    expect(update).toMatchObject({ success: true, data: { changes: 1 } });
+    return expiredAt;
+  }
+
+  test.each(['completed', 'failed', 'cancelled'] as const)('rejects new claims on %s missions even after the lease', async status => {
+    const memory = manager();
+    const { id } = await memory.createMission({ title: 'Terminal claim' });
+    await memory.updateMission({ id, claimedBy: 'worker' });
+    await memory.updateMission({ id, status: 'in_progress', claimedBy: 'worker' });
+    await memory.updateMission({ id, status, claimedBy: 'worker', ...(status === 'completed' ? { result: {} } : {}) });
+    const claimedAt = await ageClaim(id);
+    await expect(memory.updateMission({ id, claimedBy: 'other' })).rejects.toThrow('not available for claiming');
+    expect(await memory.listMissions({ id })).toMatchObject([{ status, claimedBy: 'worker', claimedAt }]);
   });
 
-  test.each(['in_progress', 'completed', 'failed', 'cancelled'] as const)('rejects claims on unclaimed %s missions', async status => {
+  test('explicit requeue repairs a legacy stuck queued mission', async () => {
     const memory = manager();
-    const mission = await memory.createMission({ title: 'Nonqueued claim' });
-    const before = await memory.updateMission({ id: mission.id, status });
-    await expect(memory.updateMission({ id: mission.id, claimedBy: 'worker' })).rejects.toThrow('not available for claiming');
-    expect((await memory.listMissions({ id: mission.id }))[0]).toEqual(before);
+    const mission = await memory.createMission({ title: 'Recover a legacy mission', payload: { preserve: true } });
+    const { id, createdAt } = mission;
+    const seed = await connections[0].executeSql('memory',
+      'UPDATE missions SET claimed_by = ?, claimed_at = ?, completed_at = ?, result = ?, error = ? WHERE id = ?',
+      ['agent-A', createdAt, createdAt, '{"ok":true}', 'stale error', id]);
+    expect(seed).toMatchObject({ success: true, data: { changes: 1 } });
+    await expect(memory.updateMission({ id, claimedBy: 'agent-B' })).rejects.toThrow('not available for claiming');
+    const requeued = await memory.updateMission({ id, action: 'requeue' });
+    expect(requeued).toEqual({ ...mission, updatedAt: requeued.updatedAt });
+    await expect(memory.updateMission({ id, claimedBy: 'agent-B' })).resolves.toMatchObject({
+      status: 'claimed', claimedBy: 'agent-B',
+    });
   });
 
   test('exactly one independent connection wins simultaneous claims on the same SQLite file', async () => {
@@ -93,10 +130,13 @@ describe('Exclusive mission claims', () => {
     await Promise.all(workers.map(worker => worker.listMissions()));
     for (let round = 0; round < 5; round++) {
       const mission = await creator.createMission({ title: `Contended mission ${round}` });
+      if (round % 2) {
+        await creator.updateMission({ id: mission.id, claimedBy: 'expired-worker' });
+        await ageClaim(mission.id);
+      }
       const attempts = await Promise.allSettled(workers.map((worker, index) => worker.updateMission({
         id: mission.id,
         claimedBy: `worker-${index}`,
-        ...(index % 2 ? { status: 'in_progress' as const } : {}),
       })));
       const winners = attempts.filter(attempt => attempt.status === 'fulfilled');
       expect(winners).toHaveLength(1);

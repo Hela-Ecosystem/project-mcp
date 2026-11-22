@@ -571,6 +571,7 @@ export const HarnessSessionsSchema = z.discriminatedUnion('action', [
 export type SyncHarnessSessionsInput = z.infer<typeof SyncHarnessSessionsSchema>;
 
 // Fleet Mission Ledger types and schemas
+export const MISSION_CLAIM_LEASE_MINUTES = 30;
 export type MissionStatus = 'queued' | 'claimed' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
 export type MissionPriority = 'low' | 'normal' | 'high' | 'urgent';
 
@@ -615,6 +616,7 @@ export const ListMissionsSchema = z.object({
 
 export const UpdateMissionSchema = z.object({
   id: z.string().min(1),
+  action: z.literal('requeue').optional(),
   status: z.enum(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled']).optional(),
   claimedBy: z.string().trim().min(1).max(100).optional(),
   result: z.unknown().optional(),
@@ -623,9 +625,11 @@ export const UpdateMissionSchema = z.object({
 }).refine(input => input.status !== 'claimed' || input.claimedBy !== undefined, {
   message: 'claimed status requires claimedBy',
   path: ['claimedBy'],
-}).refine(input => input.claimedBy === undefined || input.status === undefined || input.status === 'claimed' || input.status === 'in_progress', {
-  message: 'Claims require claimed or in_progress status',
-  path: ['status'],
+}).refine(input => input.action !== 'requeue' || (
+  input.status === undefined && input.claimedBy === undefined && input.result === undefined && input.error === undefined
+), {
+  message: 'Requeue cannot be combined with status, claimedBy, result, or error',
+  path: ['action'],
 });
 
 export type CreateMissionInput = z.input<typeof CreateMissionSchema>;

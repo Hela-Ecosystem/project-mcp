@@ -136,4 +136,8 @@ Update records in memory.db table
 
 ## `update_mission`
 
-Update mission status or results. Claim queued missions exclusively with claimedBy (status claimed or in_progress); existing claims cannot be reassigned.
+Claim a queued mission with `claimedBy` and optional `status: "claimed"`. The lease lasts 30 minutes from `claimedAt`, including while the mission is in progress. Claiming an expired mission returns it to `claimed` and starts a fresh lease.
+
+With a live claim, supply the matching `claimedBy` to move from `claimed` to `in_progress`, then to `completed` or `failed`. Completion requires a non-null JSON `result`. Failure accepts an optional `result` and `error`.
+
+Use `status: "cancelled"` from any state and supply the matching `claimedBy` for an active claim. Operators can use `action: "requeue"` with the mission ID and optional database to clear the claim and outcome and return the mission to `queued`.

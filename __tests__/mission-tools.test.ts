@@ -79,7 +79,7 @@ describe('Fleet Mission Ledger Tools', () => {
       expect(memaMissions[0].title).toBe('Postgres VACUUM run');
     });
 
-    test('should update mission lifecycle (claim -> complete)', async () => {
+    test('should update mission lifecycle (claim -> start -> complete)', async () => {
       const mission = await memoryManager.createMission({
         title: 'Build BitMusic package',
         targetAgent: 'frea',
@@ -94,9 +94,13 @@ describe('Fleet Mission Ledger Tools', () => {
       expect(claimed.claimedBy).toBe('frea');
       expect(claimed.claimedAt).toBeDefined();
 
+      await expect(memoryManager.updateMission({
+        id: mission.id, claimedBy: 'frea', status: 'in_progress',
+      })).resolves.toMatchObject({ status: 'in_progress', claimedAt: claimed.claimedAt });
       const completed = await memoryManager.updateMission({
         id: mission.id,
         status: 'completed',
+        claimedBy: 'frea',
         result: { deb: 'bitmusic_1.8.30frea8_amd64.deb', exitCode: 0 },
       });
 
@@ -110,9 +114,12 @@ describe('Fleet Mission Ledger Tools', () => {
         title: 'Run CVE scan',
       });
 
+      await memoryManager.updateMission({ id: mission.id, claimedBy: 'frea' });
+      await memoryManager.updateMission({ id: mission.id, status: 'in_progress', claimedBy: 'frea' });
       const failed = await memoryManager.updateMission({
         id: mission.id,
         status: 'failed',
+        claimedBy: 'frea',
         error: 'Container daemon unreachable',
       });
 
@@ -120,9 +127,86 @@ describe('Fleet Mission Ledger Tools', () => {
       expect(failed.error).toBe('Container daemon unreachable');
       expect(failed.completedAt).toBeDefined();
     });
+
+    test.each(['queued', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled'] as const)(
+      'can cancel a %s mission',
+      async status => {
+        const { id } = await memoryManager.createMission({ title: 'Cancel mission' });
+        const claimedBy = 'agent-A';
+        if (status !== 'queued' && status !== 'cancelled') {
+          await memoryManager.updateMission({ id, claimedBy });
+          if (status !== 'claimed') await memoryManager.updateMission({ id, status: 'in_progress', claimedBy });
+          if (status === 'completed' || status === 'failed') {
+            await memoryManager.updateMission({ id, status, claimedBy, result: { ok: status === 'completed' } });
+          }
+        }
+        if (status === 'cancelled') await memoryManager.updateMission({ id, status: 'cancelled' });
+        expect(await memoryManager.listMissions({ id })).toMatchObject([{ status }]);
+
+        const update = (agent?: string) => requestHandlers.handleToolCall('update_mission', {
+          id, status: 'cancelled', claimedBy: agent,
+        });
+        const active = status === 'claimed' || status === 'in_progress';
+        if (active) {
+          await expect(update()).rejects.toThrow('requires claimedBy');
+          await expect(update('agent-B')).rejects.toThrow('does not match');
+        }
+        await expect(update(active ? claimedBy : undefined)).resolves.toMatchObject({
+          data: { status: 'cancelled', completedAt: expect.any(String) },
+        });
+      },
+    );
   });
 
   describe('RequestHandlers Tool Calls', () => {
+    test('rejects the issue #39 sequence without leaving a stuck queued mission', async () => {
+      const { id } = await memoryManager.createMission({ title: 'Issue #39' });
+      const update = (args: Record<string, unknown>) => requestHandlers.handleToolCall('update_mission', { id, ...args });
+
+      await expect(update({ claimedBy: 'agent-A', status: 'claimed' })).resolves.toMatchObject({
+        data: { status: 'claimed', claimedBy: 'agent-A' },
+      });
+      await expect(update({ claimedBy: 'agent-B', status: 'claimed' })).rejects.toThrow('not available for claiming');
+      await expect(update({ status: 'completed', result: { ok: true } })).rejects.toThrow('claimedBy');
+      await expect(update({ status: 'queued' })).rejects.toThrow('requeue');
+      await expect(update({ claimedBy: 'agent-B', status: 'claimed' })).rejects.toThrow('not available for claiming');
+      await expect(update({ status: 'completed', claimedBy: 'agent-A', result: { ok: true } })).rejects.toThrow('cannot transition');
+
+      const [stored] = await memoryManager.listMissions({ id });
+      expect(stored).toMatchObject({ status: 'claimed', claimedBy: 'agent-A' });
+      expect(stored.completedAt).toBeUndefined();
+      expect(stored.result).toBeUndefined();
+    });
+
+    test('only the current claimant may finish an in-progress mission', async () => {
+      const { id } = await memoryManager.createMission({ title: 'Check finish ownership' });
+      const update = (args: Record<string, unknown>) => requestHandlers.handleToolCall('update_mission', { id, ...args });
+      await update({ claimedBy: 'agent-A' });
+      await update({ status: 'in_progress', claimedBy: 'agent-A' });
+
+      await expect(update({ status: 'completed', claimedBy: 'agent-B', result: { ok: true } })).rejects.toThrow('does not match');
+      await expect(update({ status: 'failed', claimedBy: 'agent-B', error: 'wrong agent' })).rejects.toThrow('does not match');
+      await expect(update({ status: 'completed', claimedBy: 'agent-A' })).rejects.toThrow('requires a result');
+      await expect(update({ status: 'completed', claimedBy: 'agent-A', result: null })).rejects.toThrow('requires a result');
+      expect(await memoryManager.listMissions({ id })).toMatchObject([{ status: 'in_progress', claimedBy: 'agent-A' }]);
+
+      await expect(update({ status: 'completed', claimedBy: 'agent-A', result: { ok: true } })).resolves.toMatchObject({
+        data: { status: 'completed', claimedBy: 'agent-A', result: { ok: true } },
+      });
+      await expect(update({ status: 'queued' })).rejects.toThrow('requeue');
+      expect(await memoryManager.listMissions({ id })).toMatchObject([{ status: 'completed', claimedBy: 'agent-A' }]);
+
+      await expect(update({ action: 'requeue' })).resolves.toMatchObject({ data: { status: 'queued' } });
+      const [queued] = await memoryManager.listMissions({ id });
+      expect(queued.claimedBy).toBeUndefined();
+      expect(queued.claimedAt).toBeUndefined();
+      expect(queued.completedAt).toBeUndefined();
+      expect(queued.result).toBeUndefined();
+      await expect(update({ claimedBy: 'agent-B' })).resolves.toMatchObject({
+        data: { status: 'claimed', claimedBy: 'agent-B' },
+      });
+    });
+
     test('create_mission and list_missions via handleToolCall', async () => {
       const createRes = await requestHandlers.handleToolCall('create_mission', {
         title: 'Global orchestrator test',
@@ -145,9 +229,11 @@ describe('Fleet Mission Ledger Tools', () => {
       const createRes = await requestHandlers.handleToolCall('create_mission', {
         title: 'Test mission for update',
       });
+      const { id } = z.object({ data: z.object({ id: z.string() }) }).parse(createRes).data;
+      await requestHandlers.handleToolCall('update_mission', { id, claimedBy: 'agent-alpha' });
 
       const updateRes = await requestHandlers.handleToolCall('update_mission', {
-        id: z.object({ data: z.object({ id: z.string() }) }).parse(createRes).data.id,
+        id,
         status: 'in_progress',
         claimedBy: 'agent-alpha',
       });
@@ -162,6 +248,10 @@ describe('Fleet Mission Ledger Tools', () => {
       { claimedBy: 'x'.repeat(101) },
       { status: 'claimed' },
       { status: 'completed', claimedBy: 'agent-alpha' },
+      { status: 'failed' },
+      { status: 'in_progress', claimedBy: 'agent-alpha' },
+      { status: 'claimed', claimedBy: 'agent-alpha', result: {} },
+      { action: 'requeue', status: 'cancelled' },
     ])('rejects invalid claims via tool validation: %j', async (claim) => {
       const mission = await memoryManager.createMission({ title: 'Invalid claim test' });
       await expect(requestHandlers.handleToolCall('update_mission', { id: mission.id, ...claim })).rejects.toThrow('Tool execution failed:');
