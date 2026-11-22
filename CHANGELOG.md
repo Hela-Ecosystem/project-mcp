@@ -2,6 +2,12 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.1.0] - 2026-11-22
+
+### Fixed
+- `delete_entities` is durable. Project deletions are recorded in a tombstone table that `syncFromCentral` respects, so a deleted entity no longer reappears from the central DB on the next sync or root switch; counts come from SQLite `changes` and missing names are reported individually. (`project-mcp#35`)
+- `security_scan` no longer opens live SQLite files. Reading `memory.db-wal`/`-shm` closed a descriptor and released SQLite's WAL locks, letting the next opener checkpoint and delete the WAL so later writes went to unlinked files. Databases and their sidecars are skipped by every walker; reproduced the lost write before the fix. (`project-mcp#36`)
+
 ## [3.0.7] - 2026-11-22
 
 ### Added
