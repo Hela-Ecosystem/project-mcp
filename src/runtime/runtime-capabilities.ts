@@ -14,6 +14,19 @@ import { PathGuard } from './path-guard.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_SECRET_FILE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * SQLite keeps its WAL locking in `-shm`, and POSIX releases *every* lock the
+ * process holds on an inode when any descriptor for it is closed. Reading a live
+ * database (or its sidecars) from this process therefore unlocks it, lets the
+ * next opener checkpoint and delete the WAL, and turns later writes into writes
+ * to unlinked files (project-mcp#36). No walker may open these paths.
+ */
+const SQLITE_ARTIFACT_RE = /(?:\.db|\.sqlite|\.sqlite3)(?:-(?:wal|shm|journal))?$|\.db-(?:wal|shm|journal)$/i;
+
+export function isSqliteArtifact(fileName: string): boolean {
+  return SQLITE_ARTIFACT_RE.test(fileName) || SQLITE_ARTIFACT_RE.test(fileName.split(/[\\/]/).pop() ?? '');
+}
 const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ['Generic API Key', /(?:key|api|token|secret|auth|password|pwd)\s*[:=]\s*['"]?([a-zA-Z0-9_-]{16,})/i],
   ['Google API Key', /AIza[0-9A-Za-z_-]{35}/],
@@ -182,11 +195,13 @@ export class RuntimeCapabilities {
 
   private async collectFiles(path: string, excludes: Set<string>, errors: string[]): Promise<string[]> {
     const info = await stat(path);
-    if (info.isFile()) return [path];
+    if (info.isFile()) return isSqliteArtifact(path) ? [] : [path];
     const files: string[] = [];
     try {
       for (const entry of await readdir(path, { withFileTypes: true })) {
         if (entry.isSymbolicLink() || excludes.has(entry.name)) continue;
+        // Never open a live SQLite database or its WAL/SHM sidecars (project-mcp#36).
+        if (entry.isFile() && isSqliteArtifact(entry.name)) continue;
         const child = join(path, entry.name);
         if (entry.isDirectory()) files.push(...await this.collectFiles(child, excludes, errors));
         else if (entry.isFile()) files.push(child);
