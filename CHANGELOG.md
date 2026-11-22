@@ -2,6 +2,13 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.1.3] - 2026-11-22
+
+### Fixed
+- Harness sync can no longer store a fabricated date. Zero, missing and seconds-based timestamps are normalised or skipped with a reported reason, and rows already written with the bogus `+032971` year are repaired in place. (`project-mcp#38`)
+- `get_timeline` reads the real timestamp, accepts a numeric `since` in milliseconds or seconds, sorts by time, and no longer treats a leading `[TAG]` in an observation as its date.
+- The dry run applies the same watermarks as a real sync, so it reports what would actually be imported.
+
 ## [3.1.2] - 2026-11-22
 
 ### Fixed
