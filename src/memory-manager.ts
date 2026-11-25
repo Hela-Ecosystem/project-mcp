@@ -439,11 +439,15 @@ export class MemoryManager {
           SELECT name, deleted_at FROM ${from}.deleted_entities WHERE true
           ON CONFLICT(name) DO UPDATE SET deleted_at = MAX(COALESCE(deleted_entities.deleted_at, ''), COALESCE(excluded.deleted_at, ''))`);
       }
-      // A copy written after the deletion (an explicit re-create) supersedes the tombstone.
+      // Tombstone rule: a tombstone is lifted only by a copy that was created after the deletion
+      // (created_at > deleted_at, which implies updated_at > deleted_at), i.e. an explicit re-create.
+      // A stale copy created before the delete and merely edited afterwards does not resurrect it.
       for (const store of ['main', 'central']) {
         await tx.run(`DELETE FROM ${store}.deleted_entities WHERE
-          EXISTS (SELECT 1 FROM main.entities e WHERE e.name = deleted_entities.name AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))
-          OR EXISTS (SELECT 1 FROM central.entities e WHERE e.name = deleted_entities.name AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))`);
+          EXISTS (SELECT 1 FROM main.entities e WHERE e.name = deleted_entities.name
+            AND e.created_at > COALESCE(deleted_entities.deleted_at, '') AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))
+          OR EXISTS (SELECT 1 FROM central.entities e WHERE e.name = deleted_entities.name
+            AND e.created_at > COALESCE(deleted_entities.deleted_at, '') AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))`);
       }
       const deleted = new Set((await tx.query('SELECT name FROM central.deleted_entities LIMIT -1'))
         .map(row => z.string().parse(row.name)));

@@ -77,6 +77,31 @@ describe('project-mcp#41 regressions', () => {
       expect((await b.memory.openNode('task:reuse'))?.observations).toEqual(['second']);
     });
 
+    test('a stale copy edited after the delete does not resurrect the entity; a re-create does', async () => {
+      const a = project();
+      const b = project();
+      await a.memory.createEntity('task:stale', 'task', ['first']);
+      await a.memory.syncToCentral();
+      await b.memory.syncFromCentral();
+      await a.memory.deleteEntity('task:stale');
+      await a.memory.syncToCentral();
+
+      // b still holds the stale copy (created before the delete) and edits it afterwards.
+      await b.memory.addObservations([{ entityName: 'task:stale', contents: ['edited after delete'] }]);
+      await b.memory.syncToCentral();
+      await b.memory.syncFromCentral();
+      await a.memory.syncFromCentral();
+
+      expect(await b.memory.openNode('task:stale')).toBeNull();
+      expect(await a.memory.openNode('task:stale')).toBeNull();
+      expect((await a.memory.readStore(a.memory.getCentralDatabaseId())).entities).toEqual([]);
+
+      await a.memory.createEntity('task:stale', 'task', ['reborn'], undefined, true);
+      await a.memory.syncToCentral();
+      await b.memory.syncFromCentral();
+      expect((await b.memory.openNode('task:stale'))?.observations).toEqual(['reborn']);
+    });
+
     test('a legacy name-only deleted_entities table is migrated without losing tombstones', async () => {
       const central = join(mkdtempSync(join(tmpdir(), 'guardian-41-legacy-')), 'central.db');
       roots.push(join(central, '..'));
