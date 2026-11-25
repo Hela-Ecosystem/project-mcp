@@ -63,24 +63,55 @@ async function saveWatermark(sqlite: SQLiteManager, harness: HarnessId, sessionI
   checkSql(result);
 }
 
-async function repairLegacyTimestamps(sqlite: SQLiteManager, memory: MemoryManager): Promise<void> {
-  for (const database of ['memory', memory.getCentralDatabaseId()]) {
-    const dbPath = database === 'memory' ? join(sqlite.getDatabasesPath(), 'memory.db') : database;
+export interface TimestampRepairReport {
+  dryRun: boolean;
+  stores: Array<{ store: 'project' | 'central'; entities: string[] }>;
+  watermarksReset: number;
+}
+
+const LEGACY_ROWS = `name GLOB 'harness:antigravity:*' AND entity_type = 'session' AND json_valid(observations)
+  AND EXISTS (SELECT 1 FROM json_each(observations) WHERE value = ? OR value LIKE ?)`;
+const legacyRowParams = [LEGACY_TIMESTAMP, `% | ${LEGACY_TIMESTAMP}`];
+
+/** Opt-in one-off cleanup of the year +032971 `updated:` marker that older syncs wrote (project-mcp#41). */
+export async function repairLegacyTimestamps(
+  sqlite: SQLiteManager,
+  memory: MemoryManager,
+  opts: { dryRun?: boolean } = {},
+): Promise<TimestampRepairReport> {
+  const dryRun = opts.dryRun ?? true;
+  const report: TimestampRepairReport = { dryRun, stores: [], watermarksReset: 0 };
+  for (const [store, database] of [['project', 'memory'], ['central', memory.getCentralDatabaseId()]] as const) {
+    const dbPath = store === 'project' ? join(sqlite.getDatabasesPath(), 'memory.db') : database;
     if (!existsSync(dbPath)) continue;
+    const found = await sqlite.executeSql(database, `SELECT name FROM entities WHERE ${LEGACY_ROWS} ORDER BY name`,
+      legacyRowParams, { readOnly: true });
+    checkSql(found, 'entities');
+    const entities = (found.data?.rows ?? []).map(row => String(row.name));
+    report.stores.push({ store, entities });
+    if (dryRun || entities.length === 0) continue;
     const result = await sqlite.executeSql(database, `UPDATE entities SET observations = (
       SELECT json_group_array(observation) FROM (
         SELECT CASE WHEN value LIKE ? THEN substr(value, 1, length(value) - ?) ELSE value END AS observation
         FROM json_each(entities.observations) WHERE value <> ? ORDER BY key
       )
-    ) WHERE name GLOB 'harness:antigravity:*' AND entity_type = 'session' AND json_valid(observations)
-      AND EXISTS (SELECT 1 FROM json_each(observations) WHERE value = ? OR value LIKE ?)`,
-    [`% | ${LEGACY_TIMESTAMP}`, LEGACY_TIMESTAMP.length + ' | '.length, LEGACY_TIMESTAMP,
-      LEGACY_TIMESTAMP, `% | ${LEGACY_TIMESTAMP}`]);
+    ) WHERE ${LEGACY_ROWS}`,
+    [`% | ${LEGACY_TIMESTAMP}`, LEGACY_TIMESTAMP.length + ' | '.length, LEGACY_TIMESTAMP, ...legacyRowParams]);
     checkSql(result, 'entities');
   }
-  const result = await sqlite.executeSql('memory',
-    `DELETE FROM ${WATERMARK_TABLE} WHERE harness = 'antigravity' AND synced_updated >= ?`, [MAX_HARNESS_EPOCH_MS]);
-  checkSql(result);
+  const watermarkPath = join(sqlite.getDatabasesPath(), 'memory.db');
+  if (existsSync(watermarkPath)) {
+    const stale = await sqlite.executeSql('memory',
+      `SELECT COUNT(*) AS n FROM ${WATERMARK_TABLE} WHERE harness = 'antigravity' AND synced_updated >= ?`,
+      [MAX_HARNESS_EPOCH_MS], { readOnly: true });
+    checkSql(stale, WATERMARK_TABLE);
+    report.watermarksReset = Number(stale.data?.rows?.[0]?.n ?? 0);
+    if (!dryRun && report.watermarksReset > 0) {
+      checkSql(await sqlite.executeSql('memory',
+        `DELETE FROM ${WATERMARK_TABLE} WHERE harness = 'antigravity' AND synced_updated >= ?`, [MAX_HARNESS_EPOCH_MS]));
+    }
+  }
+  return report;
 }
 
 function entityName(s: HarnessSession): string {
@@ -144,7 +175,6 @@ export async function syncHarnessSessions(
   const results: SyncResult[] = [];
   if (!opts.dryRun) {
     await ensureWatermarkTable(sqlite);
-    if (!wanted.size || wanted.has('antigravity')) await repairLegacyTimestamps(sqlite, memory);
   }
 
   for (const store of locateStores()) {

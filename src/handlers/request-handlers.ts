@@ -20,11 +20,12 @@ import {
 import { SearchFeedbackSchema, SearchPriorsSchema } from '../source-feedback.js';
 import { normalizeToolCall } from '../tool-aliases.js';
 import { locateStores } from '../session-bridge/stores.js';
-import { syncHarnessSessions } from '../session-bridge/sync.js';
+import { repairLegacyTimestamps, syncHarnessSessions } from '../session-bridge/sync.js';
 import { RuntimeCapabilities } from '../runtime/runtime-capabilities.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { join, resolve, isAbsolute } from 'path';
+import { READ_GRAPH_BYTE_BUDGET, jsonBytes, takeWithinBudget } from '../utils/byte-budget.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -342,7 +343,7 @@ export class RequestHandlers {
         const args = toolSchemas.memory_edit.parse(input);
         switch (args.action) {
           case 'create_entities': {
-            const entities = await this.memoryManager.createEntities(args.entities);
+            const entities = await this.memoryManager.createEntities(args.entities, args.restore ?? false);
             const failures = this.memoryManager.getLastCreateFailures();
             const failedEntities = args.entities.length - entities.length;
             return {
@@ -431,15 +432,19 @@ export class RequestHandlers {
         const graph = args.database === 'central'
           ? await this.memoryManager.readStore(this.memoryManager.getCentralDatabaseId(), { limit: limit + 1, offset })
           : await this.memoryManager.readGraph({ limit: limit + 1, offset, scope: 'project' });
-        const hasMore = graph.entities.length > limit;
+        const relations = graph.relations.slice(0, limit);
+        const entities = takeWithinBudget(graph.entities.slice(0, limit), READ_GRAPH_BYTE_BUDGET - jsonBytes(relations));
+        const truncated = entities.length < Math.min(graph.entities.length, limit);
+        const hasMore = truncated || graph.entities.length > limit;
         return {
           success: true,
           data: {
-            entities: graph.entities.slice(0, limit),
-            relations: graph.relations.slice(0, limit),
+            entities,
+            relations,
             ...(hasMore
-              ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + limit })).toString('base64url') }
+              ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + entities.length })).toString('base64url') }
               : {}),
+            ...(truncated ? { truncated: true } : {}),
           },
         };
       }
@@ -482,6 +487,17 @@ export class RequestHandlers {
         const args = toolSchemas.harness_sessions.parse(input);
         if (args.action === 'list') {
           return { success: true, data: locateStores() };
+        }
+        if (args.action === 'repair_timestamps') {
+          const report = await repairLegacyTimestamps(this.sqliteManager, this.memoryManager, { dryRun: args.apply !== true });
+          const total = report.stores.reduce((n, store) => n + store.entities.length, 0);
+          return {
+            success: true,
+            data: report,
+            message: report.dryRun
+              ? `Dry run: ${total} entity copies would be repaired (pass apply:true to write)`
+              : `Repaired ${total} entity copies`,
+          };
         }
         const results = await syncHarnessSessions(this.sqliteManager, this.memoryManager, {
           harnesses: args.harnesses,

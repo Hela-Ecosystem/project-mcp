@@ -28,7 +28,20 @@ import { createInterface } from 'readline';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+import { READ_GRAPH_BYTE_BUDGET, jsonBytes, takeWithinBudget } from './utils/byte-budget.js';
+
 const MAX_CENTRAL_BACKUPS = 7;
+const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+function describeAge(deletedAt: string | null): string {
+  const elapsed = deletedAt === null ? NaN : Date.now() - Date.parse(deletedAt);
+  if (!Number.isFinite(elapsed)) return 'at an unknown time';
+  const seconds = Math.max(0, Math.round(elapsed / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
 
 const missionRowSchema = z.object({
   id: z.string(), title: z.string(), description: z.string().nullable(),
@@ -277,15 +290,28 @@ export class MemoryManager {
   }
 
   private async ensureTombstoneSchema(database: string): Promise<void> {
-    const result = await this.sqliteManager.executeSql(database,
-      'CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL)');
-    if (!result.success) throw new Error(result.error);
-    const markDeletion = await this.sqliteManager.executeSql(database, `
-      CREATE TRIGGER IF NOT EXISTS entities_mark_deletion AFTER DELETE ON entities BEGIN
-        INSERT OR IGNORE INTO deleted_entities (name) VALUES (old.name);
-      END;
-    `);
-    if (!markDeletion.success) throw new Error(markDeletion.error);
+    const sql = async (statement: string) => {
+      const result = await this.sqliteManager.executeSql(database, statement);
+      if (!result.success) throw new Error(result.error);
+      return result;
+    };
+    await sql('CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL, deleted_at TEXT)');
+    const hasColumn = async () => ((await sql("SELECT 1 FROM pragma_table_info('deleted_entities') WHERE name = 'deleted_at'"))
+      .data?.rows?.length ?? 0) > 0;
+    if (!(await hasColumn())) {
+      // Legacy name-only table: add the column and date existing tombstones at migration time.
+      try { await sql('ALTER TABLE deleted_entities ADD COLUMN deleted_at TEXT'); }
+      catch (error) { if (!(await hasColumn())) throw error; }
+      await sql(`UPDATE deleted_entities SET deleted_at = ${NOW_SQL} WHERE deleted_at IS NULL`);
+    }
+    const trigger = await sql("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'entities_mark_deletion'");
+    if (!String(trigger.data?.rows?.[0]?.sql ?? '').includes('deleted_at')) {
+      await sql('DROP TRIGGER IF EXISTS entities_mark_deletion');
+      await sql(`CREATE TRIGGER entities_mark_deletion AFTER DELETE ON entities BEGIN
+        INSERT INTO deleted_entities (name, deleted_at) VALUES (old.name, ${NOW_SQL})
+        ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at;
+      END`);
+    }
   }
 
   private projectSchemaReady = false;
@@ -408,8 +434,21 @@ export class MemoryManager {
         .map(row => this.rowToRelation(row));
 
       // Carry tombstones first so a stale copy in either store cannot win the merge.
-      await tx.run('INSERT OR IGNORE INTO central.deleted_entities SELECT name FROM main.deleted_entities');
-      await tx.run('INSERT OR IGNORE INTO main.deleted_entities SELECT name FROM central.deleted_entities');
+      for (const [from, to] of [['main', 'central'], ['central', 'main']]) {
+        await tx.run(`INSERT INTO ${to}.deleted_entities (name, deleted_at)
+          SELECT name, deleted_at FROM ${from}.deleted_entities WHERE true
+          ON CONFLICT(name) DO UPDATE SET deleted_at = MAX(COALESCE(deleted_entities.deleted_at, ''), COALESCE(excluded.deleted_at, ''))`);
+      }
+      // Tombstone rule: a tombstone is lifted only by a copy that was created after the deletion
+      // (created_at > deleted_at, which implies updated_at > deleted_at), i.e. an explicit re-create.
+      // A stale copy created before the delete and merely edited afterwards does not resurrect it.
+      for (const store of ['main', 'central']) {
+        await tx.run(`DELETE FROM ${store}.deleted_entities WHERE
+          EXISTS (SELECT 1 FROM main.entities e WHERE e.name = deleted_entities.name
+            AND e.created_at > COALESCE(deleted_entities.deleted_at, '') AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))
+          OR EXISTS (SELECT 1 FROM central.entities e WHERE e.name = deleted_entities.name
+            AND e.created_at > COALESCE(deleted_entities.deleted_at, '') AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))`);
+      }
       const deleted = new Set((await tx.query('SELECT name FROM central.deleted_entities LIMIT -1'))
         .map(row => z.string().parse(row.name)));
       if (deleted.size > 0) {
@@ -836,19 +875,24 @@ export class MemoryManager {
     return false;
   }
 
-  async createEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
-    const entity = await this.writeEntity(name, entityType, observations, provenance);
+  async createEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>, restore = false): Promise<Entity> {
+    const entity = await this.writeEntity(name, entityType, observations, provenance, restore);
     await this.syncToCentralSafe();
     return entity;
   }
 
-  private async writeEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
+  private async writeEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>, restore = false): Promise<Entity> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     if (this.isJunkEntity(name, observations)) {
       throw new Error(`Refusing to create junk/test entity: ${name}`);
     }
-    if ((await this.readTombstones(this.centralDbPath, name)).length > 0) {
-      throw new Error(`Entity '${name}' was deleted from central memory`);
+    const [tombstone] = await this.readTombstones(this.centralDbPath, name);
+    if (tombstone) {
+      if (!restore) {
+        throw new Error(`Entity '${name}' was deleted from central memory ${describeAge(tombstone.deletedAt)}; create it with restore:true to bring the name back`);
+      }
+      const cleared = await this.sqliteManager.executeSql(this.centralDbPath, 'DELETE FROM deleted_entities WHERE name = ?', [name]);
+      if (!cleared.success) throw new Error(cleared.error);
     }
     const now = new Date().toISOString();
 
@@ -900,7 +944,7 @@ export class MemoryManager {
     };
   }
 
-  async createEntities(entities: Array<{ name: string; entityType: string; observations: string[]; provenance?: Array<ObservationProvenance | undefined> }>): Promise<Entity[]> {
+  async createEntities(entities: Array<{ name: string; entityType: string; observations: string[]; provenance?: Array<ObservationProvenance | undefined> }>, restore = false): Promise<Entity[]> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const results: Entity[] = [];
     this.lastCreateFailures = [];
@@ -910,7 +954,7 @@ export class MemoryManager {
     try {
       for (const entity of entities) {
         try {
-          const created = await this.writeEntity(entity.name, entity.entityType, entity.observations, entity.provenance);
+          const created = await this.writeEntity(entity.name, entity.entityType, entity.observations, entity.provenance, restore);
           results.push(created);
         } catch (error) {
           this.lastCreateFailures.push({
@@ -1348,11 +1392,44 @@ export class MemoryManager {
       await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK');
       throw error;
     }
+    if (changes === 0) changes = await this.deleteCentralOnlyEntity(entityName);
     if (changes > 0) {
       this.obsidianMirror.removeEntity(entityName);
       await this.syncToCentralSafe();
     }
     return changes;
+  }
+
+  /** Deletes an entity that only exists in the shared store (written by another project). */
+  private async deleteCentralOnlyEntity(entityName: string): Promise<number> {
+    if (!fs.existsSync(this.centralDbPath)) return 0;
+    await this.ensureCentralSchema();
+    const central = this.centralDbPath;
+    const run = async (sql: string, params: unknown[] = []) => {
+      const result = await this.sqliteManager.executeSql(central, sql, params);
+      if (!result.success) throw new Error(result.error || 'Central entity deletion failed');
+      return result;
+    };
+    await run('BEGIN IMMEDIATE');
+    try {
+      const row = await run('SELECT rowid FROM entities WHERE name = ?', [entityName]);
+      const rowid = row.data?.rows?.[0]?.rowid;
+      if (rowid === undefined) {
+        await run('ROLLBACK');
+        return 0;
+      }
+      await run('DELETE FROM relations WHERE from_entity = ? OR to_entity = ?', [entityName, entityName]);
+      await run('DELETE FROM observation_provenance WHERE entity_name = ?', [entityName]);
+      if (((await run("SELECT 1 FROM sqlite_schema WHERE name = 'vec_entities'")).data?.rows?.length ?? 0) > 0) {
+        await run('DELETE FROM vec_entities WHERE rowid = ?', [rowid]);
+      }
+      await run('DELETE FROM entities WHERE name = ?', [entityName]);
+      await run('COMMIT');
+      return 1;
+    } catch (error) {
+      await this.sqliteManager.executeSql(central, 'ROLLBACK');
+      throw error;
+    }
   }
 
   async deleteEntities(entityNames: string[]): Promise<{ deleted: number; missing: string[] }> {
@@ -1482,11 +1559,11 @@ export class MemoryManager {
     const edges = [...relations.values()];
     return { entities: [...entities.values()].map(entity => ({ ...entity, observations: this.cleanObservations(entity, edges) })), relations: edges };
   }
-  private async readTombstones(database: string, name?: string): Promise<string[]> {
+  private async readTombstones(database: string, name?: string): Promise<Array<{ name: string; deletedAt: string | null }>> {
     if (database === this.centralDbPath && !fs.existsSync(database)) return [];
     const result = name === undefined
-      ? await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities LIMIT -1')
-      : await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities WHERE name = ?', [name]);
+      ? await this.sqliteManager.executeSql(database, 'SELECT * FROM deleted_entities LIMIT -1')
+      : await this.sqliteManager.executeSql(database, 'SELECT * FROM deleted_entities WHERE name = ?', [name]);
     if (!result.success) {
       // A legacy or empty store may not have been opened by a sync yet.
       const schema = await this.sqliteManager.executeSql(database,
@@ -1494,7 +1571,10 @@ export class MemoryManager {
       if (schema.success && schema.data?.rows?.length === 0) return [];
       throw new Error(result.error || 'Could not read entity deletions');
     }
-    return (result.data?.rows ?? []).map(row => z.string().parse(row.name));
+    return (result.data?.rows ?? []).map(row => ({
+      name: z.string().parse(row.name),
+      deletedAt: typeof row.deleted_at === 'string' ? row.deleted_at : null,
+    }));
   }
 
   private async readDeletedNames(name?: string): Promise<Set<string>> {
@@ -1502,7 +1582,7 @@ export class MemoryManager {
       this.readTombstones(this.memoryDbName, name),
       this.readTombstones(this.centralDbPath, name),
     ]);
-    return new Set([...project, ...central]);
+    return new Set([...project, ...central].map(tombstone => tombstone.name));
   }
 
   async readStore(
@@ -1545,7 +1625,7 @@ export class MemoryManager {
     setTimeout(() => this.vacuumDatabases().catch(() => {}), 30 * 24 * 60 * 60 * 1000);
   }
 
-  async readGraphStream(cursor?: string, limit: number = 500): Promise<{ entities: Entity[]; relations: Relation[]; nextCursor: string | null }> {
+  async readGraphStream(cursor?: string, limit: number = 500, byteBudget: number = READ_GRAPH_BYTE_BUDGET): Promise<{ entities: Entity[]; relations: Relation[]; nextCursor: string | null; truncated?: boolean }> {
     const capped = Math.min(Math.max(limit, 1), 1000);
     let decoded: { updated_at: string; name: string } | null = null;
     if (cursor) {
@@ -1570,12 +1650,7 @@ export class MemoryManager {
     // Sort merged by updated_at DESC, name ASC and slice
     merged.entities.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.name.localeCompare(b.name));
     const hasMore = merged.entities.length > capped;
-    const page = hasMore ? merged.entities.slice(0, capped) : merged.entities;
-    let nextCursor: string | null = null;
-    if (hasMore && page.length > 0) {
-      const last = page[page.length - 1];
-      nextCursor = Buffer.from(JSON.stringify({ updated_at: last.updatedAt, name: last.name })).toString('base64url');
-    }
+    let page = hasMore ? merged.entities.slice(0, capped) : merged.entities;
     // Fetch relations for page entities (bounded)
     const names = page.map(e => e.name);
     let relations: Relation[] = [];
@@ -1592,7 +1667,26 @@ export class MemoryManager {
       const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
       relations = [...toRels(pr), ...toRels(cr)];
     }
-    return { entities: page, relations, nextCursor };
+    // Byte budget: each relation is charged to the first page entity it touches.
+    const position = new Map(page.map((entity, index) => [entity.name, index]));
+    const relationBytes = page.map(() => 0);
+    for (const relation of relations) {
+      const owner = Math.min(position.get(relation.from) ?? Infinity, position.get(relation.to) ?? Infinity);
+      if (owner < page.length) relationBytes[owner] += jsonBytes(relation) + 1;
+    }
+    const fitted = takeWithinBudget(page, byteBudget, (_, index) => relationBytes[index]);
+    const truncated = fitted.length < page.length;
+    if (truncated) {
+      page = fitted;
+      const kept = new Set(page.map(e => e.name));
+      relations = relations.filter(r => kept.has(r.from) || kept.has(r.to));
+    }
+    let nextCursor: string | null = null;
+    if ((hasMore || truncated) && page.length > 0) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(JSON.stringify({ updated_at: last.updatedAt, name: last.name })).toString('base64url');
+    }
+    return { entities: page, relations, nextCursor, ...(truncated ? { truncated: true } : {}) };
   }
 
   private async vecSearchDb(dbName: string, query: string, limit: number, excludedNames?: string): Promise<Entity[]> {

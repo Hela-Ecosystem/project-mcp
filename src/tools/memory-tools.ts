@@ -43,6 +43,7 @@ export const memoryTools: Tool[] = [
           minItems: 1,
           description: 'Required for create_entities',
         },
+        restore: { type: 'boolean', description: 'create_entities only: clear a deletion tombstone so a deleted name can be created again' },
         relations: {
           type: 'array',
           items: {
