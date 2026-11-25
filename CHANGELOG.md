@@ -2,6 +2,20 @@
 
 All notable changes to Project Guardian MCP.
 
+## [3.3.0] - 2026-11-25
+
+### Added
+- `create_entity` / `create_entities` accept `restore: true` to bring a deleted name back; without it the error reports the tombstone age. (`ISS-67`, `project-mcp#41`)
+- `harness_sessions` action `repair_timestamps` repairs legacy `+032971` year stamps; it reports only (`dryRun: true`) unless `apply: true` is passed. (`ISS-70`, `project-mcp#41`)
+
+### Changed
+- Tombstones carry `deleted_at`; legacy name-only `deleted_entities` tables are migrated in place. (`ISS-67`, `project-mcp#41`)
+- `read_graph` pages are capped at about 100 KB; a page that hits the cap sets `truncated: true` and returns `nextCursor`. (`ISS-71`, `project-mcp#41`)
+
+### Fixed
+- `delete_entities` reaches entities that exist only in central memory, tombstones them and removes their relations. (`ISS-68`, `project-mcp#41`)
+- Sync no longer resurrects a deleted entity from a stale copy edited after the delete. A tombstone is lifted only by a copy whose `created_at` and `updated_at` are both strictly later than `deleted_at` (an explicit re-create or `restore: true`). (`ISS-67`, `project-mcp#41`)
+
 ## [3.2.0] - 2026-11-23
 
 ### Changed
