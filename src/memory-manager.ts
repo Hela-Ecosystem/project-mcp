@@ -29,6 +29,17 @@ import { createInterface } from 'readline';
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 const MAX_CENTRAL_BACKUPS = 7;
+const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+function describeAge(deletedAt: string | null): string {
+  const elapsed = deletedAt === null ? NaN : Date.now() - Date.parse(deletedAt);
+  if (!Number.isFinite(elapsed)) return 'at an unknown time';
+  const seconds = Math.max(0, Math.round(elapsed / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
 
 const missionRowSchema = z.object({
   id: z.string(), title: z.string(), description: z.string().nullable(),
@@ -277,15 +288,28 @@ export class MemoryManager {
   }
 
   private async ensureTombstoneSchema(database: string): Promise<void> {
-    const result = await this.sqliteManager.executeSql(database,
-      'CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL)');
-    if (!result.success) throw new Error(result.error);
-    const markDeletion = await this.sqliteManager.executeSql(database, `
-      CREATE TRIGGER IF NOT EXISTS entities_mark_deletion AFTER DELETE ON entities BEGIN
-        INSERT OR IGNORE INTO deleted_entities (name) VALUES (old.name);
-      END;
-    `);
-    if (!markDeletion.success) throw new Error(markDeletion.error);
+    const sql = async (statement: string) => {
+      const result = await this.sqliteManager.executeSql(database, statement);
+      if (!result.success) throw new Error(result.error);
+      return result;
+    };
+    await sql('CREATE TABLE IF NOT EXISTS deleted_entities (name TEXT PRIMARY KEY NOT NULL, deleted_at TEXT)');
+    const hasColumn = async () => ((await sql("SELECT 1 FROM pragma_table_info('deleted_entities') WHERE name = 'deleted_at'"))
+      .data?.rows?.length ?? 0) > 0;
+    if (!(await hasColumn())) {
+      // Legacy name-only table: add the column and date existing tombstones at migration time.
+      try { await sql('ALTER TABLE deleted_entities ADD COLUMN deleted_at TEXT'); }
+      catch (error) { if (!(await hasColumn())) throw error; }
+      await sql(`UPDATE deleted_entities SET deleted_at = ${NOW_SQL} WHERE deleted_at IS NULL`);
+    }
+    const trigger = await sql("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'entities_mark_deletion'");
+    if (!String(trigger.data?.rows?.[0]?.sql ?? '').includes('deleted_at')) {
+      await sql('DROP TRIGGER IF EXISTS entities_mark_deletion');
+      await sql(`CREATE TRIGGER entities_mark_deletion AFTER DELETE ON entities BEGIN
+        INSERT INTO deleted_entities (name, deleted_at) VALUES (old.name, ${NOW_SQL})
+        ON CONFLICT(name) DO UPDATE SET deleted_at = excluded.deleted_at;
+      END`);
+    }
   }
 
   private projectSchemaReady = false;
@@ -408,8 +432,17 @@ export class MemoryManager {
         .map(row => this.rowToRelation(row));
 
       // Carry tombstones first so a stale copy in either store cannot win the merge.
-      await tx.run('INSERT OR IGNORE INTO central.deleted_entities SELECT name FROM main.deleted_entities');
-      await tx.run('INSERT OR IGNORE INTO main.deleted_entities SELECT name FROM central.deleted_entities');
+      for (const [from, to] of [['main', 'central'], ['central', 'main']]) {
+        await tx.run(`INSERT INTO ${to}.deleted_entities (name, deleted_at)
+          SELECT name, deleted_at FROM ${from}.deleted_entities WHERE true
+          ON CONFLICT(name) DO UPDATE SET deleted_at = MAX(COALESCE(deleted_entities.deleted_at, ''), COALESCE(excluded.deleted_at, ''))`);
+      }
+      // A copy written after the deletion (an explicit re-create) supersedes the tombstone.
+      for (const store of ['main', 'central']) {
+        await tx.run(`DELETE FROM ${store}.deleted_entities WHERE
+          EXISTS (SELECT 1 FROM main.entities e WHERE e.name = deleted_entities.name AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))
+          OR EXISTS (SELECT 1 FROM central.entities e WHERE e.name = deleted_entities.name AND e.updated_at > COALESCE(deleted_entities.deleted_at, ''))`);
+      }
       const deleted = new Set((await tx.query('SELECT name FROM central.deleted_entities LIMIT -1'))
         .map(row => z.string().parse(row.name)));
       if (deleted.size > 0) {
@@ -836,19 +869,24 @@ export class MemoryManager {
     return false;
   }
 
-  async createEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
-    const entity = await this.writeEntity(name, entityType, observations, provenance);
+  async createEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>, restore = false): Promise<Entity> {
+    const entity = await this.writeEntity(name, entityType, observations, provenance, restore);
     await this.syncToCentralSafe();
     return entity;
   }
 
-  private async writeEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>): Promise<Entity> {
+  private async writeEntity(name: string, entityType: string, observations: string[], provenance?: Array<ObservationProvenance | undefined>, restore = false): Promise<Entity> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     if (this.isJunkEntity(name, observations)) {
       throw new Error(`Refusing to create junk/test entity: ${name}`);
     }
-    if ((await this.readTombstones(this.centralDbPath, name)).length > 0) {
-      throw new Error(`Entity '${name}' was deleted from central memory`);
+    const [tombstone] = await this.readTombstones(this.centralDbPath, name);
+    if (tombstone) {
+      if (!restore) {
+        throw new Error(`Entity '${name}' was deleted from central memory ${describeAge(tombstone.deletedAt)}; create it with restore:true to bring the name back`);
+      }
+      const cleared = await this.sqliteManager.executeSql(this.centralDbPath, 'DELETE FROM deleted_entities WHERE name = ?', [name]);
+      if (!cleared.success) throw new Error(cleared.error);
     }
     const now = new Date().toISOString();
 
@@ -900,7 +938,7 @@ export class MemoryManager {
     };
   }
 
-  async createEntities(entities: Array<{ name: string; entityType: string; observations: string[]; provenance?: Array<ObservationProvenance | undefined> }>): Promise<Entity[]> {
+  async createEntities(entities: Array<{ name: string; entityType: string; observations: string[]; provenance?: Array<ObservationProvenance | undefined> }>, restore = false): Promise<Entity[]> {
     if (!this.projectSchemaReady) await this.ensureProjectSchema();
     const results: Entity[] = [];
     this.lastCreateFailures = [];
@@ -910,7 +948,7 @@ export class MemoryManager {
     try {
       for (const entity of entities) {
         try {
-          const created = await this.writeEntity(entity.name, entity.entityType, entity.observations, entity.provenance);
+          const created = await this.writeEntity(entity.name, entity.entityType, entity.observations, entity.provenance, restore);
           results.push(created);
         } catch (error) {
           this.lastCreateFailures.push({
@@ -1482,11 +1520,11 @@ export class MemoryManager {
     const edges = [...relations.values()];
     return { entities: [...entities.values()].map(entity => ({ ...entity, observations: this.cleanObservations(entity, edges) })), relations: edges };
   }
-  private async readTombstones(database: string, name?: string): Promise<string[]> {
+  private async readTombstones(database: string, name?: string): Promise<Array<{ name: string; deletedAt: string | null }>> {
     if (database === this.centralDbPath && !fs.existsSync(database)) return [];
     const result = name === undefined
-      ? await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities LIMIT -1')
-      : await this.sqliteManager.executeSql(database, 'SELECT name FROM deleted_entities WHERE name = ?', [name]);
+      ? await this.sqliteManager.executeSql(database, 'SELECT * FROM deleted_entities LIMIT -1')
+      : await this.sqliteManager.executeSql(database, 'SELECT * FROM deleted_entities WHERE name = ?', [name]);
     if (!result.success) {
       // A legacy or empty store may not have been opened by a sync yet.
       const schema = await this.sqliteManager.executeSql(database,
@@ -1494,7 +1532,10 @@ export class MemoryManager {
       if (schema.success && schema.data?.rows?.length === 0) return [];
       throw new Error(result.error || 'Could not read entity deletions');
     }
-    return (result.data?.rows ?? []).map(row => z.string().parse(row.name));
+    return (result.data?.rows ?? []).map(row => ({
+      name: z.string().parse(row.name),
+      deletedAt: typeof row.deleted_at === 'string' ? row.deleted_at : null,
+    }));
   }
 
   private async readDeletedNames(name?: string): Promise<Set<string>> {
@@ -1502,7 +1543,7 @@ export class MemoryManager {
       this.readTombstones(this.memoryDbName, name),
       this.readTombstones(this.centralDbPath, name),
     ]);
-    return new Set([...project, ...central]);
+    return new Set([...project, ...central].map(tombstone => tombstone.name));
   }
 
   async readStore(

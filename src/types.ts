@@ -243,7 +243,7 @@ const ObservationDeletionItemSchema = z.object({
 });
 
 export const MemoryEditSchema = z.discriminatedUnion('action', [
-  z.object({ action: z.literal('create_entities'), entities: z.array(EntityItemSchema).min(1) }).strict(),
+  z.object({ action: z.literal('create_entities'), entities: z.array(EntityItemSchema).min(1), restore: z.boolean().optional() }).strict(),
   z.object({ action: z.literal('create_relations'), relations: z.array(RelationItemSchema).min(1) }).strict(),
   z.object({ action: z.literal('add_observations'), observations: z.array(ObservationItemSchema).min(1) }).strict(),
   z.object({ action: z.literal('delete_entities'), entityNames: z.array(z.string().min(1)).min(1) }).strict(),

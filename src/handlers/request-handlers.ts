@@ -342,7 +342,7 @@ export class RequestHandlers {
         const args = toolSchemas.memory_edit.parse(input);
         switch (args.action) {
           case 'create_entities': {
-            const entities = await this.memoryManager.createEntities(args.entities);
+            const entities = await this.memoryManager.createEntities(args.entities, args.restore ?? false);
             const failures = this.memoryManager.getLastCreateFailures();
             const failedEntities = args.entities.length - entities.length;
             return {
