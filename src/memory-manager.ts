@@ -1386,11 +1386,44 @@ export class MemoryManager {
       await this.sqliteManager.executeSql(this.memoryDbName, 'ROLLBACK');
       throw error;
     }
+    if (changes === 0) changes = await this.deleteCentralOnlyEntity(entityName);
     if (changes > 0) {
       this.obsidianMirror.removeEntity(entityName);
       await this.syncToCentralSafe();
     }
     return changes;
+  }
+
+  /** Deletes an entity that only exists in the shared store (written by another project). */
+  private async deleteCentralOnlyEntity(entityName: string): Promise<number> {
+    if (!fs.existsSync(this.centralDbPath)) return 0;
+    await this.ensureCentralSchema();
+    const central = this.centralDbPath;
+    const run = async (sql: string, params: unknown[] = []) => {
+      const result = await this.sqliteManager.executeSql(central, sql, params);
+      if (!result.success) throw new Error(result.error || 'Central entity deletion failed');
+      return result;
+    };
+    await run('BEGIN IMMEDIATE');
+    try {
+      const row = await run('SELECT rowid FROM entities WHERE name = ?', [entityName]);
+      const rowid = row.data?.rows?.[0]?.rowid;
+      if (rowid === undefined) {
+        await run('ROLLBACK');
+        return 0;
+      }
+      await run('DELETE FROM relations WHERE from_entity = ? OR to_entity = ?', [entityName, entityName]);
+      await run('DELETE FROM observation_provenance WHERE entity_name = ?', [entityName]);
+      if (((await run("SELECT 1 FROM sqlite_schema WHERE name = 'vec_entities'")).data?.rows?.length ?? 0) > 0) {
+        await run('DELETE FROM vec_entities WHERE rowid = ?', [rowid]);
+      }
+      await run('DELETE FROM entities WHERE name = ?', [entityName]);
+      await run('COMMIT');
+      return 1;
+    } catch (error) {
+      await this.sqliteManager.executeSql(central, 'ROLLBACK');
+      throw error;
+    }
   }
 
   async deleteEntities(entityNames: string[]): Promise<{ deleted: number; missing: string[] }> {

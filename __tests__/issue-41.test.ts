@@ -93,4 +93,29 @@ describe('project-mcp#41 regressions', () => {
       expect(after.data?.rows[0]?.deleted_at).toEqual(expect.stringMatching(/^\d{4}-/));
     });
   });
+
+  describe('ISS-68 delete reaches entities that only live in central', () => {
+    test('deleting a central-only entity succeeds, tombstones it and hides it from other projects', async () => {
+      const writer = project();
+      const other = project();
+      await writer.memory.createEntity('task:from-writer', 'task', ['shared']);
+      await writer.memory.createRelation('task:from-writer', 'task:from-writer', 'self');
+      await writer.memory.syncToCentral();
+      const central = other.memory.getCentralDatabaseId();
+      expect((await other.memory.readStore('memory')).entities).toEqual([]);
+      expect((await other.memory.openNode('task:from-writer'))?.name).toBe('task:from-writer');
+
+      await expect(other.memory.deleteEntities(['task:from-writer', 'task:absent']))
+        .resolves.toEqual({ deleted: 1, missing: ['task:absent'] });
+
+      expect(await other.memory.openNode('task:from-writer')).toBeNull();
+      const graph = await other.memory.readStore(central);
+      expect(graph.entities).toEqual([]);
+      expect(graph.relations).toEqual([]);
+      expect((await other.sqlite.queryData(central, 'deleted_entities', { name: 'task:from-writer' })).data?.rows).toHaveLength(1);
+
+      await writer.memory.syncFromCentral();
+      expect(await writer.memory.openNode('task:from-writer')).toBeNull();
+    });
+  });
 });
