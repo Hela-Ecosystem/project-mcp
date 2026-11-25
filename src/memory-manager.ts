@@ -28,6 +28,8 @@ import { createInterface } from 'readline';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+import { READ_GRAPH_BYTE_BUDGET, jsonBytes, takeWithinBudget } from './utils/byte-budget.js';
+
 const MAX_CENTRAL_BACKUPS = 7;
 const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
@@ -1619,7 +1621,7 @@ export class MemoryManager {
     setTimeout(() => this.vacuumDatabases().catch(() => {}), 30 * 24 * 60 * 60 * 1000);
   }
 
-  async readGraphStream(cursor?: string, limit: number = 500): Promise<{ entities: Entity[]; relations: Relation[]; nextCursor: string | null }> {
+  async readGraphStream(cursor?: string, limit: number = 500, byteBudget: number = READ_GRAPH_BYTE_BUDGET): Promise<{ entities: Entity[]; relations: Relation[]; nextCursor: string | null; truncated?: boolean }> {
     const capped = Math.min(Math.max(limit, 1), 1000);
     let decoded: { updated_at: string; name: string } | null = null;
     if (cursor) {
@@ -1644,12 +1646,7 @@ export class MemoryManager {
     // Sort merged by updated_at DESC, name ASC and slice
     merged.entities.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.name.localeCompare(b.name));
     const hasMore = merged.entities.length > capped;
-    const page = hasMore ? merged.entities.slice(0, capped) : merged.entities;
-    let nextCursor: string | null = null;
-    if (hasMore && page.length > 0) {
-      const last = page[page.length - 1];
-      nextCursor = Buffer.from(JSON.stringify({ updated_at: last.updatedAt, name: last.name })).toString('base64url');
-    }
+    let page = hasMore ? merged.entities.slice(0, capped) : merged.entities;
     // Fetch relations for page entities (bounded)
     const names = page.map(e => e.name);
     let relations: Relation[] = [];
@@ -1666,7 +1663,26 @@ export class MemoryManager {
       const toRels = (r: DatabaseOperationResult<SqlExecutionData>) => r.success ? (r.data?.rows ?? []).map(row => this.rowToRelation(row)) : [];
       relations = [...toRels(pr), ...toRels(cr)];
     }
-    return { entities: page, relations, nextCursor };
+    // Byte budget: each relation is charged to the first page entity it touches.
+    const position = new Map(page.map((entity, index) => [entity.name, index]));
+    const relationBytes = page.map(() => 0);
+    for (const relation of relations) {
+      const owner = Math.min(position.get(relation.from) ?? Infinity, position.get(relation.to) ?? Infinity);
+      if (owner < page.length) relationBytes[owner] += jsonBytes(relation) + 1;
+    }
+    const fitted = takeWithinBudget(page, byteBudget, (_, index) => relationBytes[index]);
+    const truncated = fitted.length < page.length;
+    if (truncated) {
+      page = fitted;
+      const kept = new Set(page.map(e => e.name));
+      relations = relations.filter(r => kept.has(r.from) || kept.has(r.to));
+    }
+    let nextCursor: string | null = null;
+    if ((hasMore || truncated) && page.length > 0) {
+      const last = page[page.length - 1];
+      nextCursor = Buffer.from(JSON.stringify({ updated_at: last.updatedAt, name: last.name })).toString('base64url');
+    }
+    return { entities: page, relations, nextCursor, ...(truncated ? { truncated: true } : {}) };
   }
 
   private async vecSearchDb(dbName: string, query: string, limit: number, excludedNames?: string): Promise<Entity[]> {

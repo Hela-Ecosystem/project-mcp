@@ -25,6 +25,7 @@ import { RuntimeCapabilities } from '../runtime/runtime-capabilities.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { join, resolve, isAbsolute } from 'path';
+import { READ_GRAPH_BYTE_BUDGET, jsonBytes, takeWithinBudget } from '../utils/byte-budget.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -431,15 +432,19 @@ export class RequestHandlers {
         const graph = args.database === 'central'
           ? await this.memoryManager.readStore(this.memoryManager.getCentralDatabaseId(), { limit: limit + 1, offset })
           : await this.memoryManager.readGraph({ limit: limit + 1, offset, scope: 'project' });
-        const hasMore = graph.entities.length > limit;
+        const relations = graph.relations.slice(0, limit);
+        const entities = takeWithinBudget(graph.entities.slice(0, limit), READ_GRAPH_BYTE_BUDGET - jsonBytes(relations));
+        const truncated = entities.length < Math.min(graph.entities.length, limit);
+        const hasMore = truncated || graph.entities.length > limit;
         return {
           success: true,
           data: {
-            entities: graph.entities.slice(0, limit),
-            relations: graph.relations.slice(0, limit),
+            entities,
+            relations,
             ...(hasMore
-              ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + limit })).toString('base64url') }
+              ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + entities.length })).toString('base64url') }
               : {}),
+            ...(truncated ? { truncated: true } : {}),
           },
         };
       }

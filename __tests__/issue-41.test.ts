@@ -4,6 +4,9 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { SQLiteManager } from '../src/sqlite-manager';
 import { MemoryManager } from '../src/memory-manager';
+import { RequestHandlers } from '../src/handlers/request-handlers';
+import type { ImportExportManager } from '../src/import-export';
+import type { PromptHandlers } from '../src/prompts/prompt-handlers';
 
 function exec(path: string, sql: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -117,5 +120,36 @@ describe('project-mcp#41 regressions', () => {
       await writer.memory.syncFromCentral();
       expect(await writer.memory.openNode('task:from-writer')).toBeNull();
     });
+  });
+
+  describe('ISS-71 read_graph stays under a byte budget', () => {
+    const fatEntities = (count: number) => Array.from({ length: count }, (_, i) => ({
+      name: `doc:fat-${String(i).padStart(2, '0')}`,
+      entityType: 'resource',
+      observations: [`${'x'.repeat(20_000)} ${i}`],
+    }));
+
+    test.each([['merged', undefined], ['project', 'project'], ['central', 'central']] as const)(
+      '%s pages stay near 100 KB, flag truncated and cursor through every entity', async (_label, database) => {
+        const { sqlite, memory } = project();
+        await memory.createEntities(fatEntities(12));
+        await memory.syncToCentral();
+        const handlers = new RequestHandlers(sqlite, memory, {} as ImportExportManager, {} as PromptHandlers);
+
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let sawTruncated = false;
+        for (let page = 0; page < 20; page++) {
+          const result = await handlers.handleToolCall('read_graph', { ...(database ? { database } : {}), ...(cursor ? { cursor } : {}) }) as
+            { data: { entities: Array<{ name: string }>; nextCursor?: string | null; truncated?: boolean } };
+          expect(Buffer.byteLength(JSON.stringify(result.data))).toBeLessThan(110_000);
+          sawTruncated ||= result.data.truncated === true;
+          seen.push(...result.data.entities.map(entity => entity.name));
+          if (!result.data.nextCursor) break;
+          cursor = result.data.nextCursor;
+        }
+        expect(sawTruncated).toBe(true);
+        expect([...seen].sort()).toEqual(fatEntities(12).map(entity => entity.name));
+      });
   });
 });
