@@ -152,4 +152,24 @@ describe('project-mcp#41 regressions', () => {
         expect([...seen].sort()).toEqual(fatEntities(12).map(entity => entity.name));
       });
   });
+
+  describe('ISS-70 legacy year +032971 repair is explicit and opt-in', () => {
+    test('harness_sessions repair_timestamps reports by default and writes only with apply:true', async () => {
+      const { sqlite, memory } = project();
+      const handlers = new RequestHandlers(sqlite, memory, {} as ImportExportManager, {} as PromptHandlers);
+      const legacy = 'updated: +032971-04-28T00:00:00.000Z';
+      await memory.createEntity('harness:antigravity:old', 'session', ['[antigravity] Old', `messages: 3 | ${legacy}`]);
+      const stored = async () => JSON.stringify((await sqlite.executeSql('memory', 'SELECT observations FROM entities')).data?.rows);
+
+      await expect(handlers.handleToolCall('harness_sessions', { action: 'repair_timestamps' })).resolves.toMatchObject({
+        success: true, data: { dryRun: true, stores: [{ store: 'project', entities: ['harness:antigravity:old'] }] },
+      });
+      expect(await stored()).toContain(legacy);
+
+      await expect(handlers.handleToolCall('harness_sessions', { action: 'repair_timestamps', apply: true }))
+        .resolves.toMatchObject({ success: true, message: 'Repaired 1 entity copies' });
+      expect(await stored()).not.toContain(legacy);
+      expect(await stored()).toContain('messages: 3');
+    });
+  });
 });

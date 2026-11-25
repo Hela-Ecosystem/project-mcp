@@ -100,6 +100,7 @@ export function resolveSideEffects(
     return action === 'get' || action === 'scan' ? [] : ['cache-write'];
   }
   if (toolName === 'harness_sessions') {
+    if (action === 'repair_timestamps') return args?.['apply'] === true ? ['memory-write'] : [];
     return action === 'sync' && args?.['dryRun'] !== true ? ['memory-write'] : [];
   }
   return TOOL_SIDE_EFFECTS[toolName] || [];

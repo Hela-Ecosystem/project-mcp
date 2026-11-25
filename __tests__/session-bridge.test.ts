@@ -13,7 +13,7 @@ import {
   extractVscodeSessions,
   extractZedThreads,
 } from '../src/session-bridge/extractors';
-import { syncHarnessSessions } from '../src/session-bridge/sync';
+import { repairLegacyTimestamps, syncHarnessSessions } from '../src/session-bridge/sync';
 import { MemoryManager } from '../src/memory-manager';
 import { SQLiteManager } from '../src/sqlite-manager';
 
@@ -278,8 +278,26 @@ describe('session-bridge/sync', () => {
       const [repairPreview] = await syncHarnessSessions(sqlite, memory, { ...opts, dryRun: true });
       expect(repairPreview).toMatchObject({ created: 0, updated: 1, skipped: 5 });
       expect((await memory.openNode('harness:antigravity:go-zero'))?.observations[1]).toContain(legacy);
-      const [repaired] = await syncHarnessSessions(sqlite, memory, opts);
-      expect(repaired).toMatchObject({ created: 0, updated: 1, skipped: 5 });
+      // A normal sync never rewrites old rows behind the caller's back (project-mcp#41).
+      const [synced2] = await syncHarnessSessions(sqlite, memory, opts);
+      expect(synced2).toMatchObject({ created: 0, updated: 1, skipped: 5 });
+      const stored = async (database: string) => JSON.stringify((await sqlite.executeSql(database, 'SELECT observations FROM entities')).data?.rows);
+      expect(await stored('memory')).toContain(legacy);
+      expect(await stored(memory.getCentralDatabaseId())).toContain(legacy);
+
+      const dry = await repairLegacyTimestamps(sqlite, memory);
+      expect(dry).toMatchObject({ dryRun: true, watermarksReset: 1 });
+      expect(dry.stores.map(store => [store.store, store.entities])).toEqual([
+        ['project', ['harness:antigravity:go-zero', 'harness:antigravity:seconds']],
+        ['central', ['harness:antigravity:go-zero', 'harness:antigravity:seconds']],
+      ]);
+      expect(await stored('memory')).toContain(legacy);
+      expect(await stored(memory.getCentralDatabaseId())).toContain(legacy);
+
+      await expect(repairLegacyTimestamps(sqlite, memory, { dryRun: false })).resolves.toMatchObject({ dryRun: false });
+      await expect(repairLegacyTimestamps(sqlite, memory)).resolves.toMatchObject({
+        stores: [{ store: 'project', entities: [] }, { store: 'central', entities: [] }], watermarksReset: 0,
+      });
       for (const database of ['memory', memory.getCentralDatabaseId()]) {
         const saved = await sqlite.executeSql(database, 'SELECT name, observations FROM entities ORDER BY name');
         expect(saved.success).toBe(true);

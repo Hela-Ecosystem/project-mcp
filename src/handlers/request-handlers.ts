@@ -20,7 +20,7 @@ import {
 import { SearchFeedbackSchema, SearchPriorsSchema } from '../source-feedback.js';
 import { normalizeToolCall } from '../tool-aliases.js';
 import { locateStores } from '../session-bridge/stores.js';
-import { syncHarnessSessions } from '../session-bridge/sync.js';
+import { repairLegacyTimestamps, syncHarnessSessions } from '../session-bridge/sync.js';
 import { RuntimeCapabilities } from '../runtime/runtime-capabilities.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -487,6 +487,17 @@ export class RequestHandlers {
         const args = toolSchemas.harness_sessions.parse(input);
         if (args.action === 'list') {
           return { success: true, data: locateStores() };
+        }
+        if (args.action === 'repair_timestamps') {
+          const report = await repairLegacyTimestamps(this.sqliteManager, this.memoryManager, { dryRun: args.apply !== true });
+          const total = report.stores.reduce((n, store) => n + store.entities.length, 0);
+          return {
+            success: true,
+            data: report,
+            message: report.dryRun
+              ? `Dry run: ${total} entity copies would be repaired (pass apply:true to write)`
+              : `Repaired ${total} entity copies`,
+          };
         }
         const results = await syncHarnessSessions(this.sqliteManager, this.memoryManager, {
           harnesses: args.harnesses,

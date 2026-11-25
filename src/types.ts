@@ -570,6 +570,7 @@ export const HarnessSessionsSchema = z.discriminatedUnion('action', [
     dryRun: z.boolean().optional(),
     includeArchived: z.boolean().optional(),
   }).strict(),
+  z.object({ action: z.literal('repair_timestamps'), apply: z.boolean().optional() }).strict(),
 ]);
 
 export type SyncHarnessSessionsInput = z.infer<typeof SyncHarnessSessionsSchema>;
