@@ -31,18 +31,6 @@ All notable changes to Project Guardian MCP.
 - Empty `conditions` and empty updates are rejected explicitly instead of relying on a SQL syntax error.
 - CSV export prefixes cells starting with `=`, `+`, `-`, `@`, tab or CR with an apostrophe.
 
-## [Unreleased]
-
-### Fixed
-- `security_scan` reuses the session-bridge redaction pattern table, so AWS access keys and other named credential shapes are reported, and every finding carries its pattern name instead of "Generic API Key". (`project-mcp#40`)
-- `analyze_git_changes` falls back to Git's empty tree when `HEAD~N` or a root commit's parent does not exist, so a one-commit repository still reports committed and untracked files. `since` now defaults to `"0"`, meaning uncommitted changes against `HEAD`.
-- `read_graph` returns one bounded page (default 500, max 1000) plus `nextCursor`; merged reads use the existing stream cursor. `read_graph_stream` is unchanged.
-- `get_file_context` normalises absolute and parent-relative paths to the stored `file:` entity form.
-- The `bug-tracking` guidance files `bug:<slug>` with `entityType: "bug"`, matching `get_session_context`'s `openBugs` filter.
-- Raw mutating data tools (`insert_data`, `update_data`, `import_data`) share the `HELA_GENOME_ALLOW_DESTRUCTIVE` gate with `delete_data`, and `update_data`/`delete_data` reject empty conditions explicitly.
-- The generated pre-commit memory merge chains steps with `&&`, merges observations instead of discarding them, moves merged databases to `.guardian-merged/` instead of deleting them, and skips dependencies, build output, and backups.
-- CSV exports neutralise spreadsheet formulas in cells starting with `=`, `+`, `-`, `@`, tab, or carriage return.
-
 ## [3.1.3] - 2026-11-22
 
 ### Fixed
