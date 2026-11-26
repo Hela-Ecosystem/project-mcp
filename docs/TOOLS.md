@@ -48,9 +48,9 @@ Get recent observations and project activity, newest first
 
 ## `harness_sessions`
 
-List local agent-harness session stores or sync their session metadata into the knowledge graph. Select action: list (read-only paths/presence/format notes) or sync (redacted titles, summaries, timestamps; supports dryRun).
+List local agent-harness session stores or sync their session metadata into the knowledge graph. Select action: list (read-only paths/presence/format notes) sync (redacted titles, summaries, timestamps; supports dryRun), or repair_timestamps (opt-in cleanup of legacy year +032971 markers; reports only unless apply is true).
 
-Actions: `list`, `sync`.
+Actions: `list`, `sync`, `repair_timestamps`.
 
 ## `import_data`
 
